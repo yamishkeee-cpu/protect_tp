@@ -1,16 +1,22 @@
 import asyncio
+import html
+import os
 import sqlite3
-import random
 from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
-# 1. Токен вашего бота
+# 1. Токен бота берём из переменной окружения BOT_TOKEN (не храним в коде)
 BOT_TOKEN = "8803078943:AAF3RdQmYCeZqP_Z_kIYsGEBIk-IKoauQVc"
+if not BOT_TOKEN:
+    raise SystemExit("Не задан BOT_TOKEN. Запуск: BOT_TOKEN=<токен от @BotFather> python bot.py")
 
-bot = Bot(token=BOT_TOKEN)
+# Все сообщения отправляются с HTML-разметкой (<b>жирный</b>)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 
@@ -110,8 +116,9 @@ def _get_faculty_keyboard_page(page):
     page_items = FACULTY_LIST[start:end]
 
     buttons = []
-    for item in page_items:
-        buttons.append([InlineKeyboardButton(text=item, callback_data=f"faculty_{item}")])
+    for offset, item in enumerate(page_items):
+        # В callback_data кладём индекс: название длиннее лимита Telegram в 64 байта
+        buttons.append([InlineKeyboardButton(text=item, callback_data=f"faculty_{start + offset}")])
 
     nav = []
     if page > 0:
@@ -137,27 +144,27 @@ class Anketa(StatesGroup):
 async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         "👋 Привет! Это бот знакомств ВШЭ НН.\n"
-        "Давай заполним профиль. **Как тебя зовут?**",
+        "Давай заполним профиль. <b>Как тебя зовут?</b>",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(Anketa.name)
 
 @router.message(Anketa.name)
 async def process_name(message: Message, state: FSMContext):
-    name = message.text.strip()
+    name = (message.text or "").strip()
     # Проверка адекватности: непустое, длина не более 50 символов
     if not name or len(name) > 50:
         await message.answer("Введите корректное имя (не более 50 символов, не пустое).")
         return
     await state.update_data(name=name)
-    await message.answer("Введи **год твоего поступления** (например, 2024):")
+    await message.answer("Введи <b>год твоего поступления</b> (например, 2024):")
     await state.set_state(Anketa.start_year)
 
 @router.message(Anketa.start_year)
 async def process_year(message: Message, state: FSMContext):
-    year_str = message.text.strip()
+    year_str = (message.text or "").strip()
     # Проверка: должно быть целым числом и минимум 2020
-    if not year_str.isdigit():
+    if not year_str.isdecimal():
         await message.answer("Введите корректный год (только цифры).")
         return
     year = int(year_str)
@@ -168,12 +175,12 @@ async def process_year(message: Message, state: FSMContext):
         await message.answer("Год поступления не может быть больше 2030.")
         return
     await state.update_data(start_year=str(year))
-    await message.answer("Напиши **номер твоей группы** (например, БИ-201):")
+    await message.answer("Напиши <b>номер твоей группы</b> (например, БИ-201):")
     await state.set_state(Anketa.group_num)
 
 @router.message(Anketa.group_num)
 async def process_group(message: Message, state: FSMContext):
-    group = message.text.strip()
+    group = (message.text or "").strip()
     # Проверка адекватности: непустое, длина не более 20 символов
     if not group or len(group) > 20:
         await message.answer("Введите корректный номер группы (не более 20 символов, не пустое).")
@@ -181,7 +188,7 @@ async def process_group(message: Message, state: FSMContext):
 
     await state.update_data(group_num=group)
     await message.answer(
-        "Выбери **направление подготовки** из списка:",
+        "Выбери <b>направление подготовки</b> из списка:",
         reply_markup=get_faculty_keyboard()
     )
     await state.set_state(Anketa.faculty)
@@ -192,12 +199,16 @@ async def faculty_page_callback(call: types.CallbackQuery):
     await call.message.edit_reply_markup(reply_markup=_get_faculty_keyboard_page(page))
     await call.answer()
 
-@router.callback_query(F.data.startswith("faculty_") & ~F.data.startswith("facultypage_"))
+@router.callback_query(Anketa.faculty, F.data.startswith("faculty_"))
 async def faculty_callback(call: types.CallbackQuery, state: FSMContext):
-    faculty = call.data.split("faculty_")[1]
+    index = int(call.data.split("_")[1])
+    if not 0 <= index < len(FACULTY_LIST):
+        await call.answer("Это направление недоступно, выбери из списка.", show_alert=True)
+        return
+    faculty = FACULTY_LIST[index]
     await state.update_data(faculty=faculty)
     await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("Отправь **одну свою фотографию**:")
+    await call.message.answer("Отправь <b>одну свою фотографию</b>:")
     await state.set_state(Anketa.photo)
     await call.answer()
 
@@ -240,7 +251,13 @@ async def show_my_profile(message: Message):
         return
 
     name, start_year, group_num, faculty, photo = user
-    caption = f"📝 **Твой профиль:**\n👤 Имя: {name}\n📅 Год: {start_year}\n👥 Группа: {group_num}\n🎓 Направление: {faculty}"
+    caption = (
+        f"📝 <b>Твой профиль:</b>\n"
+        f"👤 Имя: {html.escape(name)}\n"
+        f"📅 Год: {html.escape(start_year)}\n"
+        f"👥 Группа: {html.escape(group_num)}\n"
+        f"🎓 Направление: {html.escape(faculty)}"
+    )
     await message.answer_photo(photo=photo, caption=caption)
 
 # ==================== МЕХАНИКА ПОИСКА ЧУЖИХ АНКЕТ ====================
@@ -255,7 +272,13 @@ async def send_random_profile(message_or_call, user_id):
         return
 
     s_id, s_name, s_year, s_group, s_faculty, s_photo = stranger
-    caption = f"🔍 **Найдена анкета:**\n👤 Имя: {s_name}\n📅 Год: {s_year}\n👥 Группа: {s_group}\n🎓 Направление: {s_faculty}"
+    caption = (
+        f"🔍 <b>Найдена анкета:</b>\n"
+        f"👤 Имя: {html.escape(s_name)}\n"
+        f"📅 Год: {html.escape(s_year)}\n"
+        f"👥 Группа: {html.escape(s_group)}\n"
+        f"🎓 Направление: {html.escape(s_faculty)}"
+    )
 
     await target.answer_photo(
         photo=s_photo,
@@ -290,15 +313,15 @@ async def like_callback(call: types.CallbackQuery):
         if call.from_user.username:
             username_text = f"🔗 Ссылка: @{call.from_user.username}"
         else:
-            username_text = f"🔗 Ссылка: [Профиль](tg://user?id={call.from_user.id})"
+            username_text = f'🔗 Ссылка: <a href="tg://user?id={call.from_user.id}">Профиль</a>'
 
         # Формируем красивый текст анкеты лайкнувшего
         notification_caption = (
-            f"❤️ **Ты понравился этому человеку!**\n\n"
-            f"👤 Имя: {my_name}\n"
-            f"📅 Год: {my_year}\n"
-            f"👥 Группа: {my_group}\n"
-            f"🎓 Направление: {my_faculty}\n\n"
+            f"❤️ <b>Ты понравился этому человеку!</b>\n\n"
+            f"👤 Имя: {html.escape(my_name)}\n"
+            f"📅 Год: {html.escape(my_year)}\n"
+            f"👥 Группа: {html.escape(my_group)}\n"
+            f"🎓 Направление: {html.escape(my_faculty)}\n\n"
             f"{username_text}"
         )
 
