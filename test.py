@@ -3,7 +3,7 @@ import sqlite3
 import random
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
@@ -61,6 +61,27 @@ def get_random_stranger(user_id):
 # Инициализируем БД при старте скрипта
 init_db()
 
+# ==================== СПИСОК НАПРАВЛЕНИЙ ====================
+# Сформировано из страницы ВШЭ НН: https://www.hse.ru/n/education/bachelor?campus=51999664
+FACULTY_LIST = [
+    "Дизайн",
+    "Иностранные языки и межкультурная бизнес-коммуникация",
+    "Компьютерные науки и технологии (Бизнес-информатика)",
+    "Компьютерные науки и технологии (Программная инженерия, очная)",
+    "Компьютерные науки и технологии (Прикладная математика и информатика)",
+    "Международная программа по бизнесу и экономике (Менеджмент)",
+    "Международная программа по бизнесу и экономике (Экономика)",
+    "Программная инженерия (очно-заочное обучение)",
+    "Технологии искусственного и дополненного интеллекта",
+    "Филология",
+    "Фундаментальная и прикладная лингвистика",
+    "Фундаментальная и прикладная математика (Математика)",
+    "Фундаментальная и прикладная математика (Прикладная математика)",
+    "Цифровой маркетинг",
+    "Экономика и бизнес (очно-заочное обучение)",
+    "Юриспруденция",
+]
+
 # ==================== КЛАВИАТУРЫ (КНОПКИ) ====================
 def get_main_menu():
     buttons = [
@@ -78,6 +99,30 @@ def get_search_keyboard(stranger_id):
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_faculty_keyboard():
+    """Клавиатура с направлениями, разбитыми на страницы."""
+    return _get_faculty_keyboard_page(0)
+
+def _get_faculty_keyboard_page(page):
+    PAGE_SIZE = 8
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_items = FACULTY_LIST[start:end]
+
+    buttons = []
+    for item in page_items:
+        buttons.append([InlineKeyboardButton(text=item, callback_data=f"faculty_{item}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"facultypage_{page - 1}"))
+    if end < len(FACULTY_LIST):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"facultypage_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 # ==================== СОСТОЯНИЯ (FSM) ====================
 class Anketa(StatesGroup):
     name = State()
@@ -91,35 +136,77 @@ class Anketa(StatesGroup):
 @router.message(F.text == "📝 Заполнить заново")
 async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
-        "👋 Привет! Это бот знакомств ВШЭ ННГУ.\n"
+        "👋 Привет! Это бот знакомств ВШЭ НН.\n"
         "Давай заполним профиль. **Как тебя зовут?**",
-        reply_markup=types.ReplyKeyboardRemove() # Прячем главное меню на время заполнения
+        reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(Anketa.name)
 
 @router.message(Anketa.name)
 async def process_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
+    name = message.text.strip()
+    # Проверка адекватности: непустое, длина не более 50 символов
+    if not name or len(name) > 50:
+        await message.answer("Введите корректное имя (не более 50 символов, не пустое).")
+        return
+    await state.update_data(name=name)
     await message.answer("Введи **год твоего поступления** (например, 2024):")
     await state.set_state(Anketa.start_year)
 
 @router.message(Anketa.start_year)
 async def process_year(message: Message, state: FSMContext):
-    await state.update_data(start_year=message.text)
-    await message.answer("Напиши **номер твоей группы**:")
+    year_str = message.text.strip()
+    # Проверка: должно быть целым числом и минимум 2020
+    if not year_str.isdigit():
+        await message.answer("Введите корректный год (только цифры).")
+        return
+    year = int(year_str)
+    if year < 2020:
+        await message.answer("Год поступления должен быть не меньше 2020.")
+        return
+    if year > 2030:
+        await message.answer("Год поступления не может быть больше 2030.")
+        return
+    await state.update_data(start_year=str(year))
+    await message.answer("Напиши **номер твоей группы** (например, БИ-201):")
     await state.set_state(Anketa.group_num)
 
 @router.message(Anketa.group_num)
 async def process_group(message: Message, state: FSMContext):
-    await state.update_data(group_num=message.text)
-    await message.answer("Укажи свое **направление/факультет**:")
+    group = message.text.strip()
+    # Проверка адекватности: непустое, длина не более 20 символов
+    if not group or len(group) > 20:
+        await message.answer("Введите корректный номер группы (не более 20 символов, не пустое).")
+        return
+    await state.update_data(group_num=group)
+    await message.answer(
+        "Выбери **направление подготовки** из списка:",
+        reply_markup=get_faculty_keyboard()
+    )
     await state.set_state(Anketa.faculty)
 
-@router.message(Anketa.faculty)
-async def process_faculty(message: Message, state: FSMContext):
-    await state.update_data(faculty=message.text)
-    await message.answer("Отправь **одну свою фотографию**:")
+@router.callback_query(F.data.startswith("facultypage_"))
+async def faculty_page_callback(call: types.CallbackQuery):
+    page = int(call.data.split("_")[1])
+    await call.message.edit_reply_markup(reply_markup=_get_faculty_keyboard_page(page))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("faculty_"))
+async def faculty_callback(call: types.CallbackQuery, state: FSMContext):
+    faculty = call.data.split("faculty_")[1]
+    await state.update_data(faculty=faculty)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("Отправь **одну свою фотографию**:")
     await state.set_state(Anketa.photo)
+    await call.answer()
+
+@router.message(Anketa.faculty)
+async def process_faculty_direct(message: Message):
+    # Пользователь ввёл текст вместо выбора из списка — просим выбрать
+    await message.answer(
+        "Пожалуйста, выбери направление из списка кнопок.",
+        reply_markup=get_faculty_keyboard()
+    )
 
 @router.message(Anketa.photo)
 async def process_photo(message: Message, state: FSMContext):
@@ -230,31 +317,9 @@ async def like_callback(call: types.CallbackQuery):
     await send_random_profile(call, call.from_user.id)
     await call.answer()
 
-
-@router.callback_query(F.data.startswith("like_"))
-async def like_callback(call: types.CallbackQuery):
+@router.callback_query(F.data == "next_profile")
+async def next_profile_callback(call: types.CallbackQuery):
     await call.message.edit_reply_markup(reply_markup=None)
-
-    # Узнаем ID того, кого лайкнули
-    stranger_id = int(call.data.split("_")[1])
-
-    # Отправляем уведомление тому, кого лайкнули
-    my_profile = get_user(call.from_user.id)
-    if my_profile:
-        my_name = my_profile[0]
-        # Отправляем ссылку на аккаунт лайкнувшего юзера
-        username_link = f"@{call.from_user.username}" if call.from_user.username else f"tg://user?id={call.from_user.id}"
-
-        try:
-            await bot.send_message(
-                chat_id=stranger_id,
-                text=f"❤️ Ты понравился пользователю **{my_name}**! Ссылка для связи: {username_link}"
-            )
-        except Exception:
-            # Если пользователь заблокировал бота, сообщение не уйдет
-            pass
-
-    await call.message.answer("Лайк отправлен! Ищем следующую анкету...")
     await send_random_profile(call, call.from_user.id)
     await call.answer()
 
