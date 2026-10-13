@@ -178,6 +178,7 @@ async def process_group(message: Message, state: FSMContext):
     if not group or len(group) > 20:
         await message.answer("Введите корректный номер группы (не более 20 символов, не пустое).")
         return
+
     await state.update_data(group_num=group)
     await message.answer(
         "Выбери **направление подготовки** из списка:",
@@ -191,7 +192,7 @@ async def faculty_page_callback(call: types.CallbackQuery):
     await call.message.edit_reply_markup(reply_markup=_get_faculty_keyboard_page(page))
     await call.answer()
 
-@router.callback_query(F.data.startswith("faculty_"))
+@router.callback_query(F.data.startswith("faculty_") & ~F.data.startswith("facultypage_"))
 async def faculty_callback(call: types.CallbackQuery, state: FSMContext):
     faculty = call.data.split("faculty_")[1]
     await state.update_data(faculty=faculty)
