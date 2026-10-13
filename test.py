@@ -184,12 +184,52 @@ async def start_search(message: Message):
     await send_random_profile(message, message.from_user.id)
 
 # ОБРАБОТКА ИНЛАЙН-КНОПОК (ЛАЙК И ДАЛЬШЕ)
-@router.callback_query(F.data == "next_profile")
-async def next_profile_callback(call: types.CallbackQuery):
-    # Удаляем старые кнопки под прошлой анкетой, чтобы не кликали дважды
+@router.callback_query(F.data.startswith("like_"))
+async def like_callback(call: types.CallbackQuery):
+    # Удаляем старые кнопки под текущей анкетой, чтобы не кликали дважды
     await call.message.edit_reply_markup(reply_markup=None)
+
+    # Узнаем ID того, кого лайкнули (stranger_id)
+    stranger_id = int(call.data.split("_")[1])
+
+    # Достаем анкету текущего пользователя (того, кто ставит лайк) из базы данных
+    my_profile = get_user(call.from_user.id)
+
+    if my_profile:
+        my_name, my_year, my_group, my_faculty, my_photo = my_profile
+
+        # Формируем ссылку на аккаунт или юзернейм
+        if call.from_user.username:
+            username_text = f"🔗 Ссылка: @{call.from_user.username}"
+        else:
+            username_text = f"🔗 Ссылка: [Профиль](tg://user?id={call.from_user.id})"
+
+        # Формируем красивый текст анкеты лайкнувшего
+        notification_caption = (
+            f"❤️ **Ты понравился этому человеку!**\n\n"
+            f"👤 Имя: {my_name}\n"
+            f"📅 Год: {my_year}\n"
+            f"👥 Группа: {my_group}\n"
+            f"🎓 Направление: {my_faculty}\n\n"
+            f"{username_text}"
+        )
+
+        try:
+            # Отправляем полную анкету с фото тому, кого лайкнули
+            await bot.send_photo(
+                chat_id=stranger_id,
+                photo=my_photo,
+                caption=notification_caption
+            )
+        except Exception:
+            # Защита на случай, если пользователь заблокировал бота
+            pass
+
+    # Пишем текущему пользователю, что лайк отправлен, и сразу показываем следующую анкету
+    await call.message.answer("Лайк отправлен! Ищем следующую анкету...")
     await send_random_profile(call, call.from_user.id)
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("like_"))
 async def like_callback(call: types.CallbackQuery):
