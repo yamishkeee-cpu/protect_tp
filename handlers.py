@@ -1,142 +1,31 @@
 import asyncio
 import html
-import os
-import sqlite3
-from aiogram import Bot, Dispatcher, Router, types, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+
+from aiogram import Router, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 
-# 1. Токен бота берём из переменной окружения BOT_TOKEN (не храним в коде)
-BOT_TOKEN = "8803078943:AAF3RdQmYCeZqP_Z_kIYsGEBIk-IKoauQVc"
-if not BOT_TOKEN:
-    raise SystemExit("Не задан BOT_TOKEN. Запуск: BOT_TOKEN=<токен от @BotFather> python bot.py")
+from db import (
+    save_user,
+    get_user,
+    get_random_stranger,
+    mark_stranger_viewed,
+    reset_all_viewed,
+)
+from keyboards import (
+    get_main_menu,
+    get_search_keyboard,
+    get_faculty_keyboard,
+    _get_faculty_keyboard_page,
+    FACULTY_LIST,
+)
+from states import Anketa
 
-# Все сообщения отправляются с HTML-разметкой (<b>жирный</b>)
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# Задержка (в секундах) между показом анкет для подгрузки новых
+PROFILE_DELAY = 1.5
+
 router = Router()
-
-# ==================== РАБОТА С БАЗОЙ ДАННЫХ (SQLite) ====================
-def init_db():
-    conn = sqlite3.connect("dating_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            name TEXT,
-            start_year TEXT,
-            group_num TEXT,
-            faculty TEXT,
-            photo TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def save_user(user_id, name, start_year, group_num, faculty, photo):
-    conn = sqlite3.connect("dating_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO users (user_id, name, start_year, group_num, faculty, photo)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, name, start_year, group_num, faculty, photo))
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = sqlite3.connect("dating_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, start_year, group_num, faculty, photo FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-def get_random_stranger(user_id):
-    conn = sqlite3.connect("dating_bot.db")
-    cursor = conn.cursor()
-    # Ищем случайного пользователя, чей ID не равен ID текущего юзера
-    cursor.execute("SELECT user_id, name, start_year, group_num, faculty, photo FROM users WHERE user_id != ? ORDER BY RANDOM() LIMIT 1", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-# Инициализируем БД при старте скрипта
-init_db()
-
-# ==================== СПИСОК НАПРАВЛЕНИЙ ====================
-# Сформировано из страницы ВШЭ НН: https://www.hse.ru/n/education/bachelor?campus=51999664
-FACULTY_LIST = [
-    "Дизайн",
-    "Иностранные языки и межкультурная бизнес-коммуникация",
-    "Компьютерные науки и технологии (Бизнес-информатика)",
-    "Компьютерные науки и технологии (Программная инженерия, очная)",
-    "Компьютерные науки и технологии (Прикладная математика и информатика)",
-    "Международная программа по бизнесу и экономике (Менеджмент)",
-    "Международная программа по бизнесу и экономике (Экономика)",
-    "Программная инженерия (очно-заочное обучение)",
-    "Технологии искусственного и дополненного интеллекта",
-    "Филология",
-    "Фундаментальная и прикладная лингвистика",
-    "Фундаментальная и прикладная математика (Математика)",
-    "Фундаментальная и прикладная математика (Прикладная математика)",
-    "Цифровой маркетинг",
-    "Экономика и бизнес (очно-заочное обучение)",
-    "Юриспруденция",
-]
-
-# ==================== КЛАВИАТУРЫ (КНОПКИ) ====================
-def get_main_menu():
-    buttons = [
-        [KeyboardButton(text="🔍 Найти анкеты")],
-        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Заполнить заново")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
-def get_search_keyboard(stranger_id):
-    buttons = [
-        [
-            InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like_{stranger_id}"),
-            InlineKeyboardButton(text="➡️ Дальше", callback_data="next_profile")
-        ]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_faculty_keyboard():
-    """Клавиатура с направлениями, разбитыми на страницы."""
-    return _get_faculty_keyboard_page(0)
-
-def _get_faculty_keyboard_page(page):
-    PAGE_SIZE = 8
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    page_items = FACULTY_LIST[start:end]
-
-    buttons = []
-    for offset, item in enumerate(page_items):
-        # В callback_data кладём индекс: название длиннее лимита Telegram в 64 байта
-        buttons.append([InlineKeyboardButton(text=item, callback_data=f"faculty_{start + offset}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"facultypage_{page - 1}"))
-    if end < len(FACULTY_LIST):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"facultypage_{page + 1}"))
-    if nav:
-        buttons.append(nav)
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-# ==================== СОСТОЯНИЯ (FSM) ====================
-class Anketa(StatesGroup):
-    name = State()
-    start_year = State()
-    group_num = State()
-    faculty = State()
-    photo = State()
 
 # ==================== ЛОГИКА АНКЕТЫ ====================
 @router.message(Command("start"))
@@ -268,10 +157,16 @@ async def send_random_profile(message_or_call, user_id):
 
     stranger = get_random_stranger(user_id)
     if not stranger:
-        await target.answer("В базе пока нет других анкет, кроме твоей. Пригласи друзей!")
+        # Все анкеты просмотрены — сбрасываем и сообщаем
+        reset_all_viewed()
+        await target.answer("🎉 <b>Все анкеты просмотрены!</b>\n\nТеперь ты можешь начать сначала.", reply_markup=get_main_menu())
         return
 
     s_id, s_name, s_year, s_group, s_faculty, s_photo = stranger
+
+    # Помечаем анкету как просмотренную
+    mark_stranger_viewed(s_id)
+
     caption = (
         f"🔍 <b>Найдена анкета:</b>\n"
         f"👤 Имя: {html.escape(s_name)}\n"
@@ -292,6 +187,8 @@ async def start_search(message: Message):
     if not get_user(message.from_user.id):
         await message.answer("Сначала заполни свою анкету, чтобы искать других!")
         return
+    # Сбрасываем просмотренные при новом поиске
+    reset_all_viewed()
     await send_random_profile(message, message.from_user.id)
 
 # ОБРАБОТКА ИНЛАЙН-КНОПОК (ЛАЙК И ДАЛЬШЕ)
@@ -336,22 +233,17 @@ async def like_callback(call: types.CallbackQuery):
             # Защита на случай, если пользователь заблокировал бота
             pass
 
-    # Пишем текущему пользователю, что лайк отправлен, и сразу показываем следующую анкету
+    # Пишем текущему пользователю, что лайк отправлен, с задержкой показываем следующую анкету
     await call.message.answer("Лайк отправлен! Ищем следующую анкету...")
+    # Задержка для подгрузки новых анкет
+    await asyncio.sleep(PROFILE_DELAY)
     await send_random_profile(call, call.from_user.id)
     await call.answer()
 
 @router.callback_query(F.data == "next_profile")
 async def next_profile_callback(call: types.CallbackQuery):
     await call.message.edit_reply_markup(reply_markup=None)
+    # Задержка для подгрузки новых анкет
+    await asyncio.sleep(PROFILE_DELAY)
     await send_random_profile(call, call.from_user.id)
     await call.answer()
-
-# ==================== ЗАПУСК БОТА ====================
-async def main():
-    dp.include_router(router)
-    print("Бот запущен и готов к работе...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
