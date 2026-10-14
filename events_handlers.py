@@ -1,548 +1,498 @@
-from aiogram import Router, types, F
-from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from aiogram.utils.markdown import hbold
+"""Event creation, event discovery, responses and owner management."""
 import html
-from datetime import datetime, timedelta
+import logging
+from datetime import date, datetime, time, timedelta
+
+from aiogram import F, Router, types
+from aiogram.exceptions import TelegramAPIError
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message
 
 from db import get_user, get_user_profile
-from keyboards import get_main_menu
 from events_db import (
+    add_event_response,
+    close_event_by_owner,
     create_event_full,
     get_active_events_for_search,
+    get_event_category_name,
     get_event_detail,
-    add_event_response,
     get_event_responses_list,
+    get_responses_count,
+    get_user_events_full,
     has_user_responded,
     mark_event_viewed,
     reset_events_viewed,
-    close_event_by_owner,
-    extend_event_by_owner,
-    get_user_events_full,
-    get_event_category_name,
-    get_event_categories_by_type
 )
-from temp_profile_db import get_user_temp_profiles
 from events_states import EventCreation
+from keyboards import (
+    get_event_category_keyboard,
+    get_event_confirm_keyboard,
+    get_event_management_keyboard,
+    get_event_search_keyboard,
+    get_main_menu,
+)
+from events_db import get_event_categories_by_type
 
+logger = logging.getLogger(__name__)
 router = Router()
-events_router = router  # Экспортируем роутер для bot.py
+events_router = router
 
-# ==================== СОЗДАНИЕ АНКЕТЫ СОБЫТИЯ ====================
 
-@router.message(F.text == "📅 Поиск мероприятий")
-async def event_search_start(message: Message, state: FSMContext):
-    """Начинает процесс создания анкеты события."""
-    await message.answer(
-        "📅 <b>Создание анкеты мероприятия</b>\n\n"
-        "Введите название события (обязательно):",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await state.set_state(EventCreation.title)
+def _parse_date(text: str):
+    try:
+        parsed = datetime.strptime(text.strip(), "%d.%m.%Y").date()
+    except (TypeError, ValueError):
+        return None
+    return parsed
 
-@router.message(EventCreation.title)
-async def process_event_title(message: Message, state: FSMContext):
-    title = message.text.strip()
-    if not title:
-        await message.answer("Название события не может быть пустым. Пожалуйста, введите название:")
-        return
 
-    await state.update_data(title=title)
-    await message.answer(
-        "Выберите тип даты события:\n"
-        "• Конкретная дата (например, 20.10.2026)\n"
-        "• Диапазон дат (например, с 20 по 23 октября)"
-    )
+def _display_date(value: str) -> str:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return value or "Не указана"
+
+
+async def _ask_date_choice(message: Message, state: FSMContext):
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="📅 Одна дата", callback_data="event_date_specific")],
+        [types.InlineKeyboardButton(text="🗓️ Диапазон дат", callback_data="event_date_range")],
+        [types.InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_event_creation")],
+    ])
+    await message.answer("Выбери тип даты события:", reply_markup=keyboard)
     await state.set_state(EventCreation.date_choice)
 
-@router.message(EventCreation.date_choice)
-async def process_event_date_choice(message: Message, state: FSMContext):
-    choice = message.text.strip().lower()
-    if choice in ["конкретная дата", "конкретная", "одна дата"]:
-        await state.update_data(date_type="specific")
-        await message.answer(
-            "Введите дату события в формате ДД.ММ.ГГГГ (например, 20.10.2026):"
-        )
-        await state.set_state(EventCreation.date_input)
-    elif choice in ["диапазон дат", "диапазон", "с ... по"]:
-        await state.update_data(date_type="range")
-        await message.answer(
-            "Введите начальную дату диапазона в формате ДД.ММ.ГГГГ (например, 20.10.2026):"
-        )
-        await state.set_state(EventCreation.date_input)
-    else:
-        await message.answer("Пожалуйста, выберите: 'конкретная дата' или 'диапазон дат':")
 
-@router.message(EventCreation.date_input)
-async def process_event_date_input(message: Message, state: FSMContext):
-    date_str = message.text.strip()
-    # Простая проверка формата ДД.ММ.ГГГГ
-    parts = date_str.split('.')
-    if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        await message.answer(
-            "Неверный формат даты. Пожалуйста, введите дату в формате ДД.ММ.ГГГГ (например, 20.10.2026):"
-        )
-        return
-
-    day, month, year = parts
-    if len(day) != 2 or len(month) != 2 or len(year) != 4:
-        await message.answer(
-            "Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 20.10.2026):"
-        )
-        return
-
-    # Проверяем корректность даты
-    try:
-        datetime(int(year), int(month), int(day))
-    except ValueError:
-        await message.answer("Пожалуйста, введите корректную дату:")
-        return
-
-    data = await state.get_data()
-    if data.get('date_type') == "specific":
-        await state.update_data(date_start=date_str, date_end=date_str)
-        await message.answer(
-            "Указывать время начала события? (например, 14:30) или напишите 'пропустить':"
-        )
-        await state.set_state(EventCreation.time_choice)
-    else:  # диапазон
-        await state.update_data(date_start=date_str)
-        await message.answer(
-            "Введите конечную дату диапазона в формате ДД.ММ.ГГГГ (например, 23.10.2026):"
-        )
-        await state.set_state(EventCreation.date_end_input)
-
-@router.message(EventCreation.date_end_input)
-async def process_event_date_end_input(message: Message, state: FSMContext):
-    date_str = message.text.strip()
-    parts = date_str.split('.')
-    if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        await message.answer(
-            "Неверный формат даты. Пожалуйста, введите дату в формате ДД.ММ.ГГГГ (например, 23.10.2026):"
-        )
-        return
-
-    day, month, year = parts
-    if len(day) != 2 or len(month) != 2 or len(year) != 4:
-        await message.answer(
-            "Неверный формат даты. Используйте ДД.ММ.ГГГГ (например, 23.10.2026):"
-        )
-        return
-
-    try:
-        datetime(int(year), int(month), int(day))
-    except ValueError:
-        await message.answer("Пожалуйста, введите корректную дату:")
-        return
-
-    await state.update_data(date_end=date_str)
-    await message.answer(
-        "Указывать время начала события? (например, 14:30) или напишите 'пропустить':"
-    )
+async def _ask_time(message: Message, state: FSMContext):
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="Без времени", callback_data="event_time_skip")],
+    ])
+    await message.answer("Введи время начала в формате ЧЧ:ММ или нажми «Без времени»:", reply_markup=keyboard)
     await state.set_state(EventCreation.time_choice)
 
-@router.message(EventCreation.time_choice)
-async def process_event_time_choice(message: Message, state: FSMContext):
-    time_input = message.text.strip()
-    if time_input.lower() in ["пропустить", "нет", "не указывать"]:
-        await state.update_data(time_start=None)
-        await message.answer("Выберите категорию события:")
-        await state.set_state(EventCreation.category_choice)
-    else:
-        # Простая проверка формата ЧЧ:ММ
-        parts = time_input.split(':')
-        if len(parts) != 2 or not all(part.isdigit() for part in parts):
-            await message.answer(
-                "Неверный формат времени. Используйте ЧЧ:ММ (например, 14:30) или напишите 'пропустить':"
-            )
-            return
 
-        hour, minute = parts
-        if len(hour) != 2 or len(minute) != 2:
-            await message.answer(
-                "Неверный формат времени. Используйте ЧЧ:ММ (например, 14:30) или напишите 'пропустить':"
-            )
-            return
-
-        try:
-            hour_int = int(hour)
-            minute_int = int(minute)
-            if hour_int < 0 or hour_int > 23 or minute_int < 0 or minute_int > 59:
-                await message.answer("Время должно быть в диапазоне 00:00 - 23:59:")
-                return
-        except ValueError:
-            await message.answer("Пожалуйста, введите корректное время:")
-            return
-
-        await state.update_data(time_start=time_input)
-        await message.answer("Выберите категорию события:")
-        await state.set_state(EventCreation.category_choice)
-
-@router.callback_query(EventCreation.category_choice)
-async def process_event_category_choice(call: types.CallbackQuery, state: FSMContext):
-    # Получаем список категорий для отображения
-    from keyboards import InlineKeyboardButton, InlineKeyboardMarkup
+async def _ask_categories(message: Message, state: FSMContext):
     categories = get_event_categories_by_type()
-
     if not categories:
-        await call.message.edit_text("Категории событий не найдены. Обратитесь к администратору.")
+        await message.answer("Категории событий не найдены. Обратись к администратору.")
         await state.clear()
-        await call.answer()
         return
+    await message.answer("Выбери категорию события:", reply_markup=get_event_category_keyboard(categories))
+    await state.set_state(EventCreation.category_choice)
 
-    buttons = []
-    for cat_id, cat_name in categories:
-        buttons.append([InlineKeyboardButton(text=cat_name, callback_data=f"event_category_{cat_id}")])
-
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    await call.message.edit_reply_markup(reply_markup=reply_markup)
-    await call.answer()
-
-@router.callback_query(F.data.startswith("event_category_"))
-async def process_event_category_selected(call: types.CallbackQuery, state: FSMContext):
-    category_id = int(call.data.split("_")[2])
-    category_name = get_event_category_name(category_id)
-    await state.update_data(category_id=category_id, category_name=category_name)
-
-    await call.message.edit_text(
-        f"Выбрана категория: {hbold(category_name)}\n\n"
-        "Указывать ожидаемое количество участников? (например, 5) или напишите 'пропустить':"
-    )
-    await state.set_state(EventCreation.people_needed_choice)
-
-@router.message(EventCreation.people_needed_choice)
-async def process_event_people_needed_choice(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() in ["пропустить", "нет", "не указывать"]:
-        await state.update_data(people_needed=None)
-        await message.answer("Введите описание события (опционально):")
-        await state.set_state(EventCreation.description)
-    else:
-        if not text.isdigit():
-            await message.answer("Пожалуйста, введите число или 'пропустить':")
-            return
-
-        count = int(text)
-        if count < 1:
-            await message.answer("Количество участников должно быть положительным числом:")
-            return
-
-        await state.update_data(people_needed=count)
-        await message.answer("Введите описание события (опционально):")
-        await state.set_state(EventCreation.description)
-
-@router.message(EventCreation.description)
-async def process_event_description(message: Message, state: FSMContext):
-    description = message.text.strip() if message.text else ""
-    await state.update_data(description=description)
-    await message.answer("Введите место проведения события (опционально):")
-    await state.set_state(EventCreation.location)
-
-@router.message(EventCreation.location)
-async def process_event_location(message: Message, state: FSMContext):
-    location = message.text.strip() if message.text else ""
-    await state.update_data(location=location)
-
-    # Показываем предварительный просмотр и запрашиваем подтверждение
-    data = await state.get_data()
-
-    # Формируем дату для отображения
-    date_display = data['date_start']
-    if data.get('date_end') and data['date_end'] != data['date_start']:
-        date_display = f"{data['date_start']} - {data['date_end']}"
-
-    time_display = data.get('time_start', 'Не указано')
-    people_display = str(data.get('people_needed', 'Не указано'))
-    category_display = data.get('category_name', 'Не выбрана')
-
-    preview_text = (
-        f"📅 <b>Предварительный просмотр анкеты события</b>\n\n"
-        f"📝 <b>Название:</b> {html.escape(data.get('title', ''))}\n"
-        f"📅 <b>Дата:</b> {html.escape(date_display)}\n"
-        f"🕐 <b>Время:</b> {html.escape(time_display)}\n"
-        f"🏷️ <b>Категория:</b> {html.escape(category_display)}\n"
-        f"👥 <b>Ожидается участников:</b> {html.escape(people_display)}\n"
-        f"📄 <b>Описание:</b> {html.escape(data.get('description', '')[:100])}{'...' if len(data.get('description', '')) > 100 else ''}\n"
-        f"📍 <b>Место:</b> {html.escape(location)}"
-    )
-
-    from keyboards import InlineKeyboardButton, InlineKeyboardMarkup
-    confirm_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Создать событие", callback_data="confirm_event_creation")],
-            [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_event_creation")],
-        ]
-    )
-
-    await call.message.edit_text(preview_text, reply_markup=confirm_keyboard)
-    await state.set_state(EventCreation.confirm)
-
-@router.callback_query(EventCreation.confirm)
-async def confirm_event_creation(call: types.CallbackQuery, state: FSMContext):
-    action = call.data
-    if action == "cancel_event_creation":
-        await call.message.edit_text("Создание события отменено.")
-        await state.clear()
-        await call.answer()
-        return
-
-    if action != "confirm_event_creation":
-        await call.answer()
-        return
-
-    user_id = call.from_user.id
-    data = await state.get_data()
-
-    # Создаем событие
-    event_id = create_event_full(
-        user_id=user_id,
-        title=data.get('title', ''),
-        date_start=data.get('date_start', ''),
-        date_end=data.get('date_end', ''),
-        time_start=data.get('time_start'),
-        category_id=data.get('category_id'),
-        people_needed=data.get('people_needed'),
-        description=data.get('description', ''),
-        location=data.get('location', '')
-    )
-
-    if event_id:
-        await call.message.edit_text(
-            f"✅ <b>Событие успешно создано!</b>\n\n"
-            f"Ваше событие получило ID: {event_id}\n"
-            f"Оно будет активно до истечения срока действия.\n"
-            f"Вы можете управлять им в своем профиле."
-        )
-    else:
-        await call.message.edit_text("❌ Ошибка при создании события. Пожалуйста, попробуйте позже.")
-
-    await state.clear()
-    await call.answer()
-
-# ==================== ПОИСК И ОТКЛИК НА СОБЫТИЯ ====================
 
 @router.message(F.text == "📅 Поиск мероприятий")
 async def event_search_or_create(message: Message, state: FSMContext):
-    """Меню: создать событие или искать события."""
-    from keyboards import InlineKeyboardButton, InlineKeyboardMarkup
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Создать событие", callback_data="create_event")],
-            [InlineKeyboardButton(text="🔍 Искать события", callback_data="search_events")],
-        ]
-    )
-    await message.answer(
-        "📅 <b>Управление мероприятий:</b>\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard
-    )
     await state.clear()
+    await message.answer("📅 <b>Мероприятия</b>\n\nВыбери действие:", reply_markup=get_event_management_keyboard())
 
-@router.callback_query(F.data == "search_events")
-async def start_event_search(call: types.CallbackQuery):
-    """Начинает поиск событий."""
-    user_id = call.from_user.id
-    user_profile = get_user_profile(user_id)
-    if not user_profile:
-        await call.message.answer(
-            "Сначала заполните свой постоянный профиль, чтобы искать события!\n"
-            "Нажмите '📝 Заполнить заново'"
-        )
-        await call.answer()
-        return
-
-    reset_events_viewed(user_id)
-    await send_random_event(call, user_id)
-    await call.answer()
 
 @router.callback_query(F.data == "create_event")
 async def start_event_creation(call: types.CallbackQuery, state: FSMContext):
-    """Начинает создание события."""
-    await call.message.edit_text(
-        "📅 <b>Создание анкеты мероприятия</b>\n\n"
-        "Введите название события (обязательно):",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    if not get_user_profile(call.from_user.id):
+        await call.answer("Сначала заполни постоянный профиль", show_alert=True)
+        return
+    await state.clear()
     await state.set_state(EventCreation.title)
+    await call.message.edit_text(
+        "📅 <b>Создание мероприятия</b>\n\nВведи название события (до 100 символов):",
+        reply_markup=None,
+    )
     await call.answer()
 
-async def send_random_event(message_or_call, user_id):
-    """Отправляет случайное событие для просмотра."""
-    is_callback = isinstance(message_or_call, types.CallbackQuery)
-    target = message_or_call.message if is_callback else message_or_call
 
-    event = get_active_events_for_search(user_id)
-    if not event:
-        # Все события просмотрены или нет активных
+@router.message(EventCreation.title)
+async def process_event_title(message: Message, state: FSMContext):
+    title = (message.text or "").strip()
+    if not title or len(title) > 100:
+        await message.answer("Название должно содержать от 1 до 100 символов. Попробуй ещё раз:")
+        return
+    await state.update_data(title=title)
+    await _ask_date_choice(message, state)
+
+
+@router.callback_query(EventCreation.date_choice, F.data.in_({"event_date_specific", "event_date_range"}))
+async def process_event_date_choice(call: types.CallbackQuery, state: FSMContext):
+    date_type = "specific" if call.data == "event_date_specific" else "range"
+    await state.update_data(date_type=date_type)
+    await call.message.edit_text("Введи дату в формате ДД.ММ.ГГГГ (например, 20.10.2026):", reply_markup=None)
+    await state.set_state(EventCreation.date_input)
+    await call.answer()
+
+
+@router.callback_query(EventCreation.date_choice, F.data == "cancel_event_creation")
+async def cancel_event_from_date_choice(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Создание мероприятия отменено.", reply_markup=None)
+    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.answer()
+
+
+@router.message(EventCreation.date_input)
+async def process_event_date_input(message: Message, state: FSMContext):
+    parsed = _parse_date(message.text or "")
+    if not parsed:
+        await message.answer("Неверная дата. Используй формат ДД.ММ.ГГГГ, например 20.10.2026:")
+        return
+    if parsed < date.today():
+        await message.answer("Дата события не может быть в прошлом. Введи дату ещё раз:")
+        return
+    data = await state.get_data()
+    await state.update_data(date_start=parsed.isoformat())
+    if data.get("date_type") == "range":
+        await message.answer("Введи конечную дату диапазона в формате ДД.ММ.ГГГГ:")
+        await state.set_state(EventCreation.date_end_input)
+    else:
+        await state.update_data(date_end=parsed.isoformat())
+        await _ask_time(message, state)
+
+
+@router.message(EventCreation.date_end_input)
+async def process_event_date_end_input(message: Message, state: FSMContext):
+    parsed = _parse_date(message.text or "")
+    data = await state.get_data()
+    start = date.fromisoformat(data["date_start"])
+    if not parsed:
+        await message.answer("Неверная дата. Используй формат ДД.ММ.ГГГГ:")
+        return
+    if parsed < start:
+        await message.answer("Конечная дата не может быть раньше начальной. Введи её ещё раз:")
+        return
+    await state.update_data(date_end=parsed.isoformat())
+    await _ask_time(message, state)
+
+
+@router.callback_query(EventCreation.time_choice, F.data == "event_time_skip")
+async def skip_event_time(call: types.CallbackQuery, state: FSMContext):
+    await state.update_data(time_start=None)
+    await call.message.edit_text("Время не указано.", reply_markup=None)
+    await _ask_categories(call.message, state)
+    await call.answer()
+
+
+@router.message(EventCreation.time_choice)
+async def process_event_time_choice(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    try:
+        parsed_time = datetime.strptime(value, "%H:%M").time()
+    except ValueError:
+        await message.answer("Введи время в формате ЧЧ:ММ, например 14:30, или нажми «Без времени».")
+        return
+    await state.update_data(time_start=parsed_time.strftime("%H:%M"))
+    await _ask_categories(message, state)
+
+
+@router.callback_query(EventCreation.category_choice, F.data.startswith("event_category_"))
+async def process_event_category_selected(call: types.CallbackQuery, state: FSMContext):
+    try:
+        category_id = int(call.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная категория", show_alert=True)
+        return
+    category_name = get_event_category_name(category_id)
+    if not category_name:
+        await call.answer("Категория не найдена", show_alert=True)
+        return
+    await state.update_data(category_id=category_id, category_name=category_name)
+    await call.message.edit_text(
+        f"Выбрана категория: <b>{html.escape(category_name)}</b>\n\n"
+        "Сколько участников нужно для этого мероприятия? Введи число от 1 до 1000:",
+        reply_markup=None,
+    )
+    await state.set_state(EventCreation.people_needed_choice)
+    await call.answer()
+
+
+@router.message(EventCreation.people_needed_choice)
+async def process_event_people_needed_choice(message: Message, state: FSMContext):
+    value = (message.text or "").strip().lower()
+    if not value.isdecimal() or int(value) < 1 or int(value) > 1000:
+        await message.answer("Введи целое число от 1 до 1000.")
+        return
+    await state.update_data(people_needed=int(value))
+    await message.answer("Напиши описание события или отправь «пропустить»:")
+    await state.set_state(EventCreation.description)
+
+
+@router.message(EventCreation.description)
+async def process_event_description(message: Message, state: FSMContext):
+    description = (message.text or "").strip()
+    if description.lower() in {"пропустить", "нет", "skip"}:
+        description = ""
+    if len(description) > 1500:
+        await message.answer("Описание слишком длинное. Максимум — 1500 символов.")
+        return
+    await state.update_data(description=description)
+    await message.answer("Укажи место проведения или отправь «пропустить»:")
+    await state.set_state(EventCreation.location)
+
+
+@router.message(EventCreation.location)
+async def process_event_location(message: Message, state: FSMContext):
+    location = (message.text or "").strip()
+    if location.lower() in {"пропустить", "нет", "skip"}:
+        location = ""
+    if len(location) > 250:
+        await message.answer("Место должно быть не длиннее 250 символов.")
+        return
+    await state.update_data(location=location)
+    data = await state.get_data()
+    start_display = _display_date(data["date_start"])
+    end_display = _display_date(data.get("date_end") or data["date_start"])
+    date_display = start_display if start_display == end_display else f"{start_display} — {end_display}"
+    people = str(data["people_needed"]) if data.get("people_needed") else "Не указано"
+    text = (
+        "📅 <b>Проверь мероприятие</b>\n\n"
+        f"📝 <b>Название:</b> {html.escape(data['title'])}\n"
+        f"📅 <b>Дата:</b> {html.escape(date_display)}\n"
+        f"🕐 <b>Время:</b> {html.escape(data.get('time_start') or 'Не указано')}\n"
+        f"🏷️ <b>Категория:</b> {html.escape(data.get('category_name') or 'Не выбрана')}\n"
+        f"👥 <b>Нужно участников:</b> {html.escape(people)}\n"
+        f"📄 <b>Описание:</b> {html.escape(data.get('description') or 'Не указано')}\n"
+        f"📍 <b>Место:</b> {html.escape(location or 'Не указано')}\n\nСоздать событие?"
+    )
+    await message.answer(text, reply_markup=get_event_confirm_keyboard())
+    await state.set_state(EventCreation.confirm)
+
+
+@router.callback_query(EventCreation.confirm, F.data == "cancel_event_creation")
+async def cancel_event_creation(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Создание мероприятия отменено.", reply_markup=None)
+    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.answer()
+
+
+@router.callback_query(EventCreation.confirm, F.data == "confirm_event_creation")
+async def confirm_event_creation(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    try:
+        event_id = create_event_full(
+            user_id=call.from_user.id,
+            title=data["title"],
+            date_start=data["date_start"],
+            date_end=data.get("date_end") or data["date_start"],
+            time_start=data.get("time_start"),
+            category_id=data.get("category_id"),
+            people_needed=data.get("people_needed"),
+            description=data.get("description", ""),
+            location=data.get("location", ""),
+        )
+    except (ValueError, KeyError):
+        logger.exception("Invalid event creation data for user %s", call.from_user.id)
+        await call.answer("Не удалось создать событие. Проверь данные и попробуй ещё раз.", show_alert=True)
+        return
+    except Exception:
+        logger.exception("Failed to create event for user %s", call.from_user.id)
+        await call.answer("Ошибка базы данных при создании события", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text(
+        f"✅ <b>Мероприятие создано!</b>\nНомер анкеты: #{event_id}.\n"
+        "Оно будет доступно для поиска до дня после окончания события.",
+        reply_markup=None,
+    )
+    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.answer("Событие сохранено")
+
+
+@router.callback_query(F.data == "search_events")
+async def start_event_search(call: types.CallbackQuery):
+    if not get_user_profile(call.from_user.id):
+        await call.answer("Сначала заполни постоянный профиль", show_alert=True)
+        return
+    await call.answer()
+    await send_random_event(call, call.from_user.id)
+
+
+async def send_random_event(message_or_call, user_id: int):
+    target = message_or_call.message if isinstance(message_or_call, types.CallbackQuery) else message_or_call
+    events = get_active_events_for_search(user_id)
+    if not events:
         reset_events_viewed(user_id)
         await target.answer(
-            "🎉 <b>Все события просмотрены или нет активных событий!</b>\n\n"
-            "Теперь вы можете начать сначала или создать свое событие.",
-            reply_markup=get_main_menu()
+            "🎉 Сейчас нет новых доступных мероприятий. История просмотра сброшена — попробуй поиск позже.",
+            reply_markup=get_main_menu(),
         )
         return
-
-    e_id, e_title, e_date_start, e_date_end, e_time_start, e_people_needed, e_description, e_location, \
-    e_category_name, e_category_type, e_creator_name, e_creator_photo = event
-
-    # Помечаем событие как просмотренное
-    mark_event_viewed(user_id, e_id)
-
-    # Формируем дату для отображения
-    date_display = e_date_start
-    if e_date_end and e_date_end != e_date_start:
-        date_display = f"{e_date_start} - {e_date_end}"
-
-    time_display = e_time_start or "Не указано"
-    people_display = str(e_people_needed) if e_people_needed else "Не указано"
-
-    caption = (
-        f"📅 <b>Найдено событие:</b>\n\n"
-        f"📝 <b>Название:</b> {html.escape(e_title)}\n"
+    event = events[0]
+    (event_id, title, date_start, date_end, time_start, people_needed,
+     description, location, category_name, category_type, creator_name, creator_photo, participant_profile_id) = event
+    mark_event_viewed(user_id, event_id)
+    date_display = _display_date(date_start)
+    if date_end and date_end != date_start:
+        date_display += f" — {_display_date(date_end)}"
+    text = (
+        "📅 <b>Мероприятие</b>\n\n"
+        f"📝 <b>Название:</b> {html.escape(title or '')}\n"
         f"📅 <b>Дата:</b> {html.escape(date_display)}\n"
-        f"🕐 <b>Время:</b> {html.escape(time_display)}\n"
-        f"🏷️ <b>Категория:</b> {html.escape(e_category_name)}\n"
-        f"👥 <b>Ожидается участников:</b> {html.escape(people_display)}\n"
-        f"📄 <b>Описание:</b> {html.escape(e_description[:100])}{'...' if len(e_description) > 100 else ''}\n"
-        f"📍 <b>Место:</b> {html.escape(e_location)}\n"
-        f"👤 <b>Создатель:</b> {html.escape(e_creator_name)}"
+        f"🕐 <b>Время:</b> {html.escape(time_start or 'Не указано')}\n"
+        f"🏷️ <b>Категория:</b> {html.escape(category_name or 'Не указана')}\n"
+        f"👥 <b>Нужно участников:</b> {html.escape(str(people_needed) if people_needed else 'Не указано')}\n"
+        f"📄 <b>Описание:</b> {html.escape((description or 'Не указано')[:800])}\n"
+        f"📍 <b>Место:</b> {html.escape(location or 'Не указано')}\n"
+        f"👤 <b>Организатор:</b> {html.escape(creator_name or 'Не указан')}\n"
+        f"🧩 <b>Анкета события:</b> #{participant_profile_id}"
     )
-
-    from keyboards import InlineKeyboardButton, InlineKeyboardMarkup
-    # Проверяем, не откликался ли уже пользователь
-    has_responded = has_user_responded(e_id, user_id)
-
-    buttons = [
-        [InlineKeyboardButton(text="👍 Откликнуться", callback_data=f"event_respond_{e_id}")],
-        [InlineKeyboardButton(text="➡️ Дальше", callback_data="event_next_profile")]
-    ]
-    if has_responded:
-        buttons[0][0] = InlineKeyboardButton(text="✅ Вы уже откликнулись", callback_data="already_responded")
-
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    await target.answer_photo(
-        photo=e_creator_photo,
-        caption=caption,
-        reply_markup=reply_markup
-    )
-
-@router.message(F.text == "🔍 Найти анкеты")
-async def start_event_search(message: Message):
-    user_profile = get_user_profile(message.from_user.id)
-    if not user_profile:
-        await message.answer(
-            "Сначала заполните свой постоянный профиль, чтобы искать события!\n"
-            "Нажмите '📝 Заполнить заново'"
+    keyboard = get_event_search_keyboard(event_id, has_user_responded(event_id, user_id))
+    if creator_photo and len(text) <= 950:
+        await target.answer_photo(photo=creator_photo, caption=text, reply_markup=keyboard)
+    elif creator_photo:
+        # Telegram captions are shorter than normal messages. Keep the controls
+        # attached to the image and deliver the complete details separately.
+        await target.answer_photo(
+            photo=creator_photo,
+            caption="📅 <b>Мероприятие</b>",
+            reply_markup=keyboard,
         )
-        return
+        await target.answer(text)
+    else:
+        await target.answer(text, reply_markup=keyboard)
 
-    reset_events_viewed(message.from_user.id)
-    await send_random_event(message, message.from_user.id)
 
-@router.callback_query(F.data == "event_next_profile")
+@router.callback_query(F.data.startswith("event_next_"))
 async def next_event_callback(call: types.CallbackQuery):
-    await call.message.edit_reply_markup(reply_markup=None)
-    await send_random_event(call, call.from_user.id)
     await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await send_random_event(call, call.from_user.id)
+
+
+@router.callback_query(F.data == "already_responded")
+async def already_responded_callback(call: types.CallbackQuery):
+    await call.answer("Ты уже откликнулся на это мероприятие")
+
+
+@router.callback_query(F.data == "stop_event_search")
+async def stop_event_search(call: types.CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer("Поиск мероприятий остановлен.", reply_markup=get_main_menu())
+
 
 @router.callback_query(F.data.startswith("event_respond_"))
 async def event_respond_callback(call: types.CallbackQuery):
-    event_id = int(call.data.split("_")[2])
-    user_id = call.from_user.id
-
-    # Добавляем отклик
-    response_id = add_event_response(event_id, user_id)
-
+    try:
+        event_id = int(call.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректное событие", show_alert=True)
+        return
+    event = get_event_detail(event_id)
+    if not event:
+        await call.answer("Событие уже недоступно", show_alert=True)
+        return
+    response_id = add_event_response(event_id, call.from_user.id)
+    await call.answer("Отклик отправлен" if response_id else "Вы уже откликались или событие недоступно",
+                      show_alert=not bool(response_id))
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
     if response_id:
-        await call.message.edit_text("✅ Ваш отклик отправлен создателю события!")
-        await call.message.answer("Ищем следующее событие...", reply_markup=get_main_menu())
+        creator_id = event[1]
+        responder = get_user_profile(call.from_user.id) or get_user(call.from_user.id)
+        responder_name = responder[0] if responder else (call.from_user.full_name or "Пользователь")
+        link = f'<a href="tg://user?id={call.from_user.id}">Открыть профиль в Telegram</a>'
+        try:
+            await call.bot.send_message(
+                creator_id,
+                "🔔 <b>Новый отклик на мероприятие!</b>\n\n"
+                f"📝 Событие: {html.escape(event[2] or '')}\n"
+                f"👤 Откликнулся: {html.escape(responder_name or 'Пользователь')}\n{link}",
+            )
+        except TelegramAPIError:
+            logger.info("Could not notify event owner %s", creator_id)
+        await call.message.answer("✅ Отклик отправлен организатору.")
+        await send_random_event(call, call.from_user.id)
 
-        # Уведомляем создателя события
-        event_detail = get_event_detail(event_id)
-        if event_detail:
-            creator_id = event_detail[1]  # user_id создателя
-            creator_name = event_detail[14]  # creator_name
-            responder_name = call.from_user.full_name or call.from_user.username or f"Пользователь {user_id}"
 
-            try:
-                await bot.send_message(
-                    chat_id=creator_id,
-                    text=f"🔔 <b>Новый отклик на ваше событие!</b>\n\n"
-                         f"📝 Событие: {html.escape(event_detail[2])}\n"
-                         f"👤 Откликнулся: {html.escape(responder_name)}\n"
-                         f"💬 Вы можете посмотреть все отклики в разделе '💬 Отклики'",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass  # Пользователь мог заблокировать бота
-    else:
-        await call.message.edit_text("❌ Вы уже откликнулись на это событие.")
-
+@router.callback_query(F.data == "my_events")
+async def show_my_events(call: types.CallbackQuery):
+    events = get_user_events_full(call.from_user.id)
+    if not events:
+        await call.message.edit_text("У тебя пока нет созданных мероприятий.", reply_markup=None)
+        await call.answer()
+        return
+    lines = ["📋 <b>Твои мероприятия</b>\n"]
+    buttons = []
+    for row in events:
+        event_id, title, date_start, date_end, time_start, people_needed, description, location, category_id, status = row[:10]
+        date_display = _display_date(date_start)
+        if date_end and date_end != date_start:
+            date_display += f" — {_display_date(date_end)}"
+        status_text = {"active": "Активно", "closed": "Закрыто", "expired": "Истекло"}.get(status, status)
+        count = get_responses_count(event_id)
+        lines.append(
+            f"<b>#{event_id} {html.escape(title)}</b>\n"
+            f"📅 {html.escape(date_display)} · {html.escape(status_text)}\n"
+            f"🙋 Откликов: {count}{f' / {people_needed}' if people_needed else ''}\n"
+        )
+        if status == "active":
+            buttons.append([types.InlineKeyboardButton(text=f"Закрыть #{event_id}", callback_data=f"close_event_{event_id}")])
+        buttons.append([types.InlineKeyboardButton(text=f"Отклики #{event_id}", callback_data=f"event_responses_{event_id}")])
+    buttons.append([types.InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    await call.message.edit_text("\n".join(lines), reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
 
-# ==================== УПРАВЛЕНИЕ СОБЫТИЯМИ ====================
 
-@router.message(F.text == "💬 Отклики")
-async def show_my_responses(message: Message):
-    """Показывает отклики на события пользователя."""
-    user_id = message.from_user.id
-    user_events = get_user_events_full(user_id)
-
-    if not user_events:
-        await message.answer(
-            "У вас пока нет созданных событий.\n"
-            "Создайте первое событие через '📅 Поиск мероприятий'",
-            reply_markup=get_main_menu()
-        )
+@router.callback_query(F.data.startswith("close_event_"))
+async def close_my_event(call: types.CallbackQuery):
+    try:
+        event_id = int(call.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный номер", show_alert=True)
         return
+    close_event_by_owner(event_id, call.from_user.id)
+    await show_my_events(call)
 
-    text = "💬 <b>Отклики на ваши события</b>\n\n"
-    for event in user_events:
-        e_id, e_title, e_date_start, e_date_end, e_people_needed, e_status, e_created_at = event[0], event[1], event[2], event[3], event[5], event[9], event[10]
 
-        responses_count = get_responses_count(e_id)
-        people_needed_display = f" / {e_people_needed}" if e_people_needed else ""
-
-        date_display = e_date_start
-        if e_date_end and e_date_end != e_date_start:
-            date_display = f"{e_date_start} - {e_date_end}"
-
-        status_emoji = "🟢" if e_status == "active" else "🔴"
-        status_text = "Активно" if e_status == "active" else "Закрыто"
-
-        text += (
-            f"{status_emoji} <b>{html.escape(e_title)}</b>\n"
-            f"📅 {html.escape(date_display)}\n"
-            f"👥 Откликов: {responses_count}{people_needed_display}\n"
-            f"📊 Статус: {status_text}\n\n"
-        )
-
-    await message.answer(text, reply_markup=get_main_menu())
-
-@router.message(F.text == "👤 Мой профиль")
-async def show_my_profile_with_events(message: Message):
-    """Расширенный профиль с информацией о событиях."""
-    user_id = message.from_user.id
-    user_profile = get_user_profile(user_id)
-    user_events = get_user_events_full(user_id)
-    user_temp_profiles = get_user_temp_profiles(user_id)  # из temp_profile_db
-
-    if not user_profile:
-        await message.answer("Вы еще не заполнили постоянный профиль. Нажмите '📝 Заполнить заново'")
+@router.callback_query(F.data.startswith("event_responses_"))
+async def show_event_responses(call: types.CallbackQuery):
+    try:
+        event_id = int(call.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный номер", show_alert=True)
         return
+    responses = get_event_responses_list(event_id, call.from_user.id)
+    if not responses:
+        await call.message.edit_text("На это мероприятие пока нет откликов или оно не принадлежит тебе.", reply_markup=None)
+        await call.answer()
+        return
+    lines = [f"💬 <b>Отклики на мероприятие #{event_id}</b>\n"]
+    for row in responses:
+        _, user_id, created_at, name, photo, year, group, faculty = row
+        lines.append(
+            f"👤 {html.escape(name or 'Без имени')} — "
+            f"{html.escape(group or 'группа не указана')}\n"
+            f"<a href=\"tg://user?id={user_id}\">Связаться в Telegram</a>\n"
+        )
+    back = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🔙 К моим мероприятиям", callback_data="my_events")]
+    ])
+    await call.message.edit_text("\n".join(lines), reply_markup=back)
+    await call.answer()
 
-    name, start_year, group_num, faculty, photo = user_profile
 
-    caption = (
-        f"👤 <b>Ваш постоянный профиль:</b>\n"
-        f"👤 Имя: {html.escape(name)}\n"
-        f"📅 Год: {html.escape(start_year)}\n"
-        f"👥 Группа: {html.escape(group_num)}\n"
-        f"🎓 Факультет: {html.escape(faculty)}\n\n"
-        f"📋 <b>Ваши временные анкеты:</b> {len(user_temp_profiles)} активных\n"
-        f"📅 <b>Ваши события:</b> {len(user_events)} (активных/закрытых)\n"
-    )
-
-    await message.answer_photo(photo=photo, caption=caption, reply_markup=get_main_menu())
+@router.callback_query(F.data == "my_event_responses")
+async def show_my_responses(call: types.CallbackQuery):
+    events = get_user_events_full(call.from_user.id)
+    if not events:
+        await call.message.edit_text("У тебя пока нет созданных мероприятий.", reply_markup=None)
+        await call.answer()
+        return
+    lines = ["💬 <b>Отклики на твои мероприятия</b>\n"]
+    buttons = []
+    for row in events:
+        event_id, title, start_date, end_date, _, people_needed, *_ = row
+        count = get_responses_count(event_id)
+        lines.append(f"<b>#{event_id} {html.escape(title)}</b> — откликов: {count}\n")
+        if count:
+            buttons.append([types.InlineKeyboardButton(text=f"Посмотреть #{event_id}", callback_data=f"event_responses_{event_id}")])
+    buttons.append([types.InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
+    await call.message.edit_text("\n".join(lines), reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()

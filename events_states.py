@@ -12,7 +12,7 @@ class EventCreation(StatesGroup):
     time_input = State()     # Ввод времени (HH:MM)
     # Категория события
     category_choice = State()
-    # Количество людей (опционально)
+    # Количество людей (обязательно)
     people_needed_choice = State()
     people_needed_input = State()
     # Описание (опционально)

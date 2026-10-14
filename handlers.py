@@ -1,248 +1,298 @@
-import asyncio
+"""Permanent profile registration, profile browsing, and mutual likes."""
 import html
+import logging
 
-from aiogram import Router, types, F
+from aiogram import F, Router, types
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, ReplyKeyboardRemove
 
 from db import (
-    save_user,
-    get_user,
+    add_like,
     get_random_stranger,
+    get_user,
+    get_user_profile,
+    has_like,
     mark_stranger_viewed,
     reset_all_viewed,
+    save_user,
 )
-from keyboards import (
-    get_main_menu,
-    get_search_keyboard,
-    get_faculty_keyboard,
-    FACULTY_LIST,
-)
+from keyboards import FACULTY_LIST, get_faculty_keyboard, get_main_menu, get_search_keyboard
 from states import Anketa
 
-# Задержка (в секундах) между показом анкет для подгрузки новых
-PROFILE_DELAY = 1.5
-
+logger = logging.getLogger(__name__)
 router = Router()
+PROFILE_DELAY = 0.2
 
-# ==================== ЛОГИКА АНКЕТЫ ====================
-@router.message(Command("start"))
-@router.message(F.text == "📝 Заполнить заново")
-async def cmd_start(message: Message, state: FSMContext):
+
+async def begin_registration(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(
-        "👋 Привет! Это бот знакомств ВШЭ НН.\n"
-        "Давай заполним профиль. <b>Как тебя зовут?</b>",
-        reply_markup=ReplyKeyboardRemove()
+        "👋 Привет! Это бот знакомств ВШЭ НН.\n\n"
+        "Давай заполним постоянный профиль. Как тебя зовут?",
+        reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(Anketa.name)
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    existing = get_user_profile(message.from_user.id)
+    if existing:
+        await state.clear()
+        await message.answer(
+            f"С возвращением, {html.escape(existing[0] or 'пользователь')}! Выбери действие в меню.",
+            reply_markup=get_main_menu(),
+        )
+        return
+    await begin_registration(message, state)
+
+
+@router.message(Command("cancel"))
+async def cancel_current_flow(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Текущее действие отменено.", reply_markup=get_main_menu())
+
+
+@router.message(F.text == "📝 Заполнить заново")
+async def restart_registration(message: Message, state: FSMContext):
+    await begin_registration(message, state)
+
 
 @router.message(Anketa.name)
 async def process_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
-    # Проверка адекватности: непустое, длина не более 50 символов
     if not name or len(name) > 50:
-        await message.answer("Введите корректное имя (не более 50 символов, не пустое).")
+        await message.answer("Введите имя длиной от 1 до 50 символов.")
         return
     await state.update_data(name=name)
-    await message.answer("Введи <b>год твоего поступления</b> (например, 2024):")
+    await message.answer("Введи год поступления (например, 2024):")
     await state.set_state(Anketa.start_year)
+
 
 @router.message(Anketa.start_year)
 async def process_year(message: Message, state: FSMContext):
-    year_str = (message.text or "").strip()
-    # Проверка: должно быть целым числом и минимум 2020
-    if not year_str.isdecimal():
-        await message.answer("Введите корректный год (только цифры).")
+    year_text = (message.text or "").strip()
+    if not year_text.isdecimal():
+        await message.answer("Введите год цифрами, например 2024.")
         return
-    year = int(year_str)
-    if year < 2020:
-        await message.answer("Год поступления должен быть не меньше 2020.")
-        return
-    if year > 2030:
-        await message.answer("Год поступления не может быть больше 2030.")
+    year = int(year_text)
+    if not 2000 <= year <= 2035:
+        await message.answer("Проверь год поступления и введи год от 2000 до 2035.")
         return
     await state.update_data(start_year=str(year))
-    await message.answer("Напиши <b>номер твоей группы</b> (например, БИ-201):")
+    await message.answer("Напиши номер группы (например, БИ-201):")
     await state.set_state(Anketa.group_num)
+
 
 @router.message(Anketa.group_num)
 async def process_group(message: Message, state: FSMContext):
     group = (message.text or "").strip()
-    # Проверка адекватности: непустое, длина не более 20 символов
-    if not group or len(group) > 20:
-        await message.answer("Введите корректный номер группы (не более 20 символов, не пустое).")
+    if not group or len(group) > 30:
+        await message.answer("Введите номер группы длиной от 1 до 30 символов.")
         return
-
     await state.update_data(group_num=group)
-    await message.answer(
-        "Выбери <b>направление подготовки</b> из списка:",
-        reply_markup=get_faculty_keyboard()
-    )
+    await message.answer("Выбери направление подготовки:", reply_markup=get_faculty_keyboard())
     await state.set_state(Anketa.faculty)
+
 
 @router.callback_query(F.data.startswith("facultypage_"))
 async def faculty_page_callback(call: types.CallbackQuery):
-    page = int(call.data.split("_")[1])
-    await call.message.edit_reply_markup(reply_markup=_get_faculty_keyboard_page(page))
+    try:
+        page = int(call.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница", show_alert=True)
+        return
+    await call.message.edit_reply_markup(reply_markup=get_faculty_keyboard(page))
     await call.answer()
+
 
 @router.callback_query(Anketa.faculty, F.data.startswith("faculty_"))
 async def faculty_callback(call: types.CallbackQuery, state: FSMContext):
-    index = int(call.data.split("_")[1])
-    if not 0 <= index < len(FACULTY_LIST):
-        await call.answer("Это направление недоступно, выбери из списка.", show_alert=True)
+    try:
+        index = int(call.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректное направление", show_alert=True)
         return
-    faculty = FACULTY_LIST[index]
-    await state.update_data(faculty=faculty)
+    if not 0 <= index < len(FACULTY_LIST):
+        await call.answer("Это направление недоступно. Выбери из списка.", show_alert=True)
+        return
+    await state.update_data(faculty=FACULTY_LIST[index])
     await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("Отправь <b>одну свою фотографию</b>:")
+    await call.message.answer("Отправь одну свою фотографию:")
     await state.set_state(Anketa.photo)
     await call.answer()
 
+
 @router.message(Anketa.faculty)
 async def process_faculty_direct(message: Message):
-    # Пользователь ввёл текст вместо выбора из списка — просим выбрать
-    await message.answer(
-        "Пожалуйста, выбери направление из списка кнопок.",
-        reply_markup=get_faculty_keyboard()
-    )
+    await message.answer("Пожалуйста, выбери направление кнопкой ниже:", reply_markup=get_faculty_keyboard())
+
 
 @router.message(Anketa.photo)
 async def process_photo(message: Message, state: FSMContext):
     if not message.photo:
-        await message.answer("Пожалуйста, отправь именно фото.")
+        await message.answer("Пожалуйста, отправь именно фотографию.")
         return
-
     photo_id = message.photo[-1].file_id
-    user_data = await state.get_data()
-
-    # СОХРАНЯЕМ В БАЗУ ДАННЫХ
-    save_user(
-        user_id=message.from_user.id,
-        name=user_data['name'],
-        start_year=user_data['start_year'],
-        group_num=user_data['group_num'],
-        faculty=user_data['faculty'],
-        photo=photo_id
-    )
-
-    await message.answer("🎉 Профиль успешно сохранен!", reply_markup=get_main_menu())
+    data = await state.get_data()
+    try:
+        save_user(
+            user_id=message.from_user.id,
+            name=data["name"],
+            start_year=data["start_year"],
+            group_num=data["group_num"],
+            faculty=data["faculty"],
+            photo=photo_id,
+        )
+    except Exception:
+        logger.exception("Failed to save permanent profile for user %s", message.from_user.id)
+        await message.answer("Не удалось сохранить профиль. Попробуй ещё раз позже.")
+        return
     await state.clear()
+    await message.answer("🎉 Профиль сохранён! Теперь можно искать людей.", reply_markup=get_main_menu())
 
-# ==================== ПРОСМОТР СВОЕГО ПРОФИЛЯ ====================
+
 @router.message(F.text == "👤 Мой профиль")
 async def show_my_profile(message: Message):
-    user = get_user(message.from_user.id)
+    user = get_user_profile(message.from_user.id) or get_user(message.from_user.id)
     if not user:
-        await message.answer("Ты еще не заполнил анкету. Нажми '📝 Заполнить заново'")
+        await message.answer("Ты ещё не заполнил анкету. Нажми «📝 Заполнить заново».", reply_markup=get_main_menu())
         return
-
     name, start_year, group_num, faculty, photo = user
     caption = (
-        f"📝 <b>Твой профиль:</b>\n"
-        f"👤 Имя: {html.escape(name)}\n"
-        f"📅 Год: {html.escape(start_year)}\n"
-        f"👥 Группа: {html.escape(group_num)}\n"
-        f"🎓 Направление: {html.escape(faculty)}"
+        "📝 <b>Твой профиль</b>\n"
+        f"👤 Имя: {html.escape(name or 'Не указано')}\n"
+        f"📅 Год поступления: {html.escape(start_year or 'Не указан')}\n"
+        f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
+        f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
     )
-    await message.answer_photo(photo=photo, caption=caption)
+    if photo:
+        await message.answer_photo(photo=photo, caption=caption, reply_markup=get_main_menu())
+    else:
+        await message.answer(caption, reply_markup=get_main_menu())
 
-# ==================== МЕХАНИКА ПОИСКА ЧУЖИХ АНКЕТ ====================
-async def send_random_profile(message_or_call, user_id):
-    # Метод может вызываться как из текстового сообщения, так и из инлайн-кнопки
-    is_callback = isinstance(message_or_call, types.CallbackQuery)
-    target = message_or_call.message if is_callback else message_or_call
 
+async def send_random_profile(message_or_call, user_id: int):
+    target = message_or_call.message if isinstance(message_or_call, types.CallbackQuery) else message_or_call
     stranger = get_random_stranger(user_id)
     if not stranger:
-        # Все анкеты просмотрены — сбрасываем и сообщаем
-        reset_all_viewed()
-        await target.answer("🎉 <b>Все анкеты просмотрены!</b>\n\nТеперь ты можешь начать сначала.", reply_markup=get_main_menu())
+        # Exhaustion is per-user, not global. Clear this user's history so that
+        # the next search begins a new cycle without disturbing other users.
+        reset_all_viewed(user_id)
+        await target.answer(
+            "🎉 Пока больше нет новых анкет. История просмотра сброшена — можешь начать поиск снова.",
+            reply_markup=get_main_menu(),
+        )
         return
 
-    s_id, s_name, s_year, s_group, s_faculty, s_photo = stranger
-
-    # Помечаем анкету как просмотренную
-    mark_stranger_viewed(s_id)
-
+    profile_id, name, year, group_num, faculty, photo = stranger
+    mark_stranger_viewed(user_id, profile_id)
     caption = (
-        f"🔍 <b>Найдена анкета:</b>\n"
-        f"👤 Имя: {html.escape(s_name)}\n"
-        f"📅 Год: {html.escape(s_year)}\n"
-        f"👥 Группа: {html.escape(s_group)}\n"
-        f"🎓 Направление: {html.escape(s_faculty)}"
+        "🔍 <b>Анкета</b>\n"
+        f"👤 Имя: {html.escape(name or 'Не указано')}\n"
+        f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
+        f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
+        f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
     )
+    keyboard = get_search_keyboard(profile_id)
+    if photo:
+        await target.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
+    else:
+        await target.answer(caption, reply_markup=keyboard)
 
-    await target.answer_photo(
-        photo=s_photo,
-        caption=caption,
-        reply_markup=get_search_keyboard(s_id)
-    )
 
-@router.message(F.text == "🔍 Найти анкеты")
-async def start_search(message: Message):
-    # Проверяем, заполнил ли сам пользователь анкету перед поиском
-    if not get_user(message.from_user.id):
-        await message.answer("Сначала заполни свою анкету, чтобы искать других!")
+@router.message(F.text == "🔍 Поиск людей для общения")
+async def start_search(message: Message, state: FSMContext):
+    await state.clear()
+    if not get_user_profile(message.from_user.id):
+        await message.answer("Сначала заполни постоянный профиль: нажми «📝 Заполнить заново».", reply_markup=get_main_menu())
         return
-    # Сбрасываем просмотренные при новом поиске
-    reset_all_viewed()
     await send_random_profile(message, message.from_user.id)
 
-# ОБРАБОТКА ИНЛАЙН-КНОПОК (ЛАЙК И ДАЛЬШЕ)
+
+async def _send_liker_profile(bot, receiver_id: int, liker_id: int, mutual: bool) -> None:
+    profile = get_user_profile(liker_id) or get_user(liker_id)
+    if not profile:
+        await bot.send_message(receiver_id, "Кто-то поставил тебе лайк, но его профиль уже недоступен.")
+        return
+    name, year, group_num, faculty, photo = profile
+    link = f'<a href="tg://user?id={liker_id}">Открыть профиль в Telegram</a>'
+    intro = "💞 <b>У вас взаимная симпатия!</b>" if mutual else "❤️ <b>Кому-то понравилась твоя анкета!</b>"
+    caption = (
+        f"{intro}\n\n"
+        f"👤 Имя: {html.escape(name or 'Не указано')}\n"
+        f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
+        f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
+        f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n\n{link}"
+    )
+    if photo:
+        await bot.send_photo(receiver_id, photo=photo, caption=caption)
+    else:
+        await bot.send_message(receiver_id, caption)
+
+
 @router.callback_query(F.data.startswith("like_"))
 async def like_callback(call: types.CallbackQuery):
-    # Удаляем старые кнопки под текущей анкетой, чтобы не кликали дважды
-    await call.message.edit_reply_markup(reply_markup=None)
-
-    # Узнаем ID того, кого лайкнули (stranger_id)
-    stranger_id = int(call.data.split("_")[1])
-
-    # Достаем анкету текущего пользователя (того, кто ставит лайк) из базы данных
-    my_profile = get_user(call.from_user.id)
-
-    if my_profile:
-        my_name, my_year, my_group, my_faculty, my_photo = my_profile
-
-        # Формируем ссылку на аккаунт или юзернейм
-        if call.from_user.username:
-            username_text = f"🔗 Ссылка: @{call.from_user.username}"
-        else:
-            username_text = f'🔗 Ссылка: <a href="tg://user?id={call.from_user.id}">Профиль</a>'
-
-        # Формируем красивый текст анкеты лайкнувшего
-        notification_caption = (
-            f"❤️ <b>Ты понравился этому человеку!</b>\n\n"
-            f"👤 Имя: {html.escape(my_name)}\n"
-            f"📅 Год: {html.escape(my_year)}\n"
-            f"👥 Группа: {html.escape(my_group)}\n"
-            f"🎓 Направление: {html.escape(my_faculty)}\n\n"
-            f"{username_text}"
-        )
-
+    try:
+        stranger_id = int(call.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная анкета", show_alert=True)
+        return
+    if stranger_id == call.from_user.id or not get_user_profile(stranger_id):
+        await call.answer("Эта анкета уже недоступна", show_alert=True)
+        return
+    reciprocal = has_like(stranger_id, call.from_user.id)
+    is_new_like = add_like(call.from_user.id, stranger_id)
+    await call.answer("Лайк отправлен" if is_new_like else "Ты уже ставил лайк этой анкете")
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    if is_new_like:
         try:
-            # Отправляем полную анкету с фото тому, кого лайкнули
-            await bot.send_photo(
-                chat_id=stranger_id,
-                photo=my_photo,
-                caption=notification_caption
-            )
-        except Exception:
-            # Защита на случай, если пользователь заблокировал бота
-            pass
-
-    # Пишем текущему пользователю, что лайк отправлен, с задержкой показываем следующую анкету
-    await call.message.answer("Лайк отправлен! Ищем следующую анкету...")
-    # Задержка для подгрузки новых анкет
-    await asyncio.sleep(PROFILE_DELAY)
+            await _send_liker_profile(call.bot, stranger_id, call.from_user.id, reciprocal)
+        except TelegramAPIError:
+            logger.info("Could not notify the liked user about a like")
+        if reciprocal:
+            try:
+                await _send_liker_profile(call.bot, call.from_user.id, stranger_id, True)
+            except TelegramAPIError:
+                logger.info("Could not notify the current user about a mutual like")
+    await call.message.answer("❤️ Лайк обработан. Показываю следующую анкету…")
     await send_random_profile(call, call.from_user.id)
-    await call.answer()
 
-@router.callback_query(F.data == "next_profile")
+
+@router.callback_query(F.data.startswith("dislike_"))
+@router.callback_query(F.data.startswith("next_profile_"))
 async def next_profile_callback(call: types.CallbackQuery):
-    await call.message.edit_reply_markup(reply_markup=None)
-    # Задержка для подгрузки новых анкет
-    await asyncio.sleep(PROFILE_DELAY)
-    await send_random_profile(call, call.from_user.id)
     await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await send_random_profile(call, call.from_user.id)
+
+
+@router.callback_query(F.data == "stop_search")
+async def stop_search_callback(call: types.CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await call.message.answer("Поиск остановлен. Что делаем дальше?", reply_markup=get_main_menu())
+
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu_callback(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer()
+    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+
+
+@router.callback_query(F.data == "edit_profile")
+async def edit_profile_callback(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await begin_registration(call.message, state)
