@@ -3,7 +3,7 @@ import html
 import logging
 
 from aiogram import F, Router, types
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, ReplyKeyboardRemove
@@ -20,17 +20,27 @@ from db import (
 )
 from keyboards import FACULTY_LIST, get_faculty_keyboard, get_main_menu, get_search_keyboard
 from states import Anketa
-
+from aiogram.types import LinkPreviewOptions
 logger = logging.getLogger(__name__)
 router = Router()
 PROFILE_DELAY = 0.2
 
-
-async def begin_registration(message: Message, state: FSMContext) -> None:
+POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-10-14-105"
+async def begin_registration(message: Message, state: FSMContext, first_time: bool = False) -> None:
     await state.clear()
-    await message.answer(
+    text = (
         "👋 Привет! Это бот знакомств ВШЭ НН.\n\n"
-        "Давай заполним постоянный профиль. Как тебя зовут?",
+        "Давай заполним постоянный профиль. Как тебя зовут?"
+    )
+    # Ссылку на политику показываем только при первом запуске
+    if first_time:
+        text += (
+            "\n\nПри дальнейшем использовании бота вы соглашаетесь с "
+            f'<a href="{POLICY_URL}">политикой конфиденциальности</a>'
+        )
+    await message.answer(
+        text,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
         reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(Anketa.name)
@@ -42,11 +52,14 @@ async def cmd_start(message: Message, state: FSMContext):
     if existing:
         await state.clear()
         await message.answer(
-            f"С возвращением, {html.escape(existing[0] or 'пользователь')}! Выбери действие в меню.",
+            f"С возвращением, {html.escape(existing[0] or 'пользователь')}! "
+            f'Напоминаем тебе о <a href="{POLICY_URL}">политике конфиденциальности</a>.\n'
+            "Выбери действие в меню.",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
             reply_markup=get_main_menu(),
         )
         return
-    await begin_registration(message, state)
+    await begin_registration(message, state, first_time=True)
 
 
 @router.message(Command("cancel"))
@@ -82,7 +95,7 @@ async def process_year(message: Message, state: FSMContext):
         await message.answer("Проверь год поступления и введи год от 2000 до 2035.")
         return
     await state.update_data(start_year=str(year))
-    await message.answer("Напиши номер группы (например, БИ-201):")
+    await message.answer("Напиши номер группы")
     await state.set_state(Anketa.group_num)
 
 
@@ -155,7 +168,7 @@ async def process_photo(message: Message, state: FSMContext):
 
 
 @router.message(F.text == "👤 Мой профиль")
-async def show_my_profile(message: Message):
+async def show_my_profile(message: Message, state: FSMContext):
     user = get_user_profile(message.from_user.id) or get_user(message.from_user.id)
     if not user:
         await message.answer("Ты ещё не заполнил анкету. Нажми «📝 Заполнить заново».", reply_markup=get_main_menu())
@@ -169,38 +182,52 @@ async def show_my_profile(message: Message):
         f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
     )
     if photo:
-        await message.answer_photo(photo=photo, caption=caption, reply_markup=get_main_menu())
-    else:
-        await message.answer(caption, reply_markup=get_main_menu())
+        try:
+            await message.answer_photo(photo=photo, caption=caption, reply_markup=get_main_menu())
+            return
+        except TelegramBadRequest:
+            # Фото устарело (например, сменился бот): просим загрузить заново, остальные данные оставляем
+            logger.warning("Broken photo file_id for user %s", message.from_user.id)
+            await state.update_data(name=name, start_year=start_year, group_num=group_num, faculty=faculty)
+            await state.set_state(Anketa.photo)
+            await message.answer("Твоё фото больше не открывается. Отправь, пожалуйста, новую фотографию:",
+                                 reply_markup=ReplyKeyboardRemove())
+            return
+    await message.answer(caption, reply_markup=get_main_menu())
 
 
 async def send_random_profile(message_or_call, user_id: int):
     target = message_or_call.message if isinstance(message_or_call, types.CallbackQuery) else message_or_call
-    stranger = get_random_stranger(user_id)
-    if not stranger:
-        # Exhaustion is per-user, not global. Clear this user's history so that
-        # the next search begins a new cycle without disturbing other users.
-        reset_all_viewed(user_id)
-        await target.answer(
-            "🎉 Пока больше нет новых анкет. История просмотра сброшена — можешь начать поиск снова.",
-            reply_markup=get_main_menu(),
-        )
-        return
+    for _ in range(20):  # анкеты с нерабочим фото пропускаем
+        stranger = get_random_stranger(user_id)
+        if not stranger:
+            # Exhaustion is per-user, not global. Clear this user's history so that
+            # the next search begins a new cycle without disturbing other users.
+            reset_all_viewed(user_id)
+            await target.answer(
+                "🎉 Пока больше нет новых анкет. История просмотра сброшена — можешь начать поиск снова.",
+                reply_markup=get_main_menu(),
+            )
+            return
 
-    profile_id, name, year, group_num, faculty, photo = stranger
-    mark_stranger_viewed(user_id, profile_id)
-    caption = (
-        "🔍 <b>Анкета</b>\n"
-        f"👤 Имя: {html.escape(name or 'Не указано')}\n"
-        f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
-        f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
-        f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
-    )
-    keyboard = get_search_keyboard(profile_id)
-    if photo:
-        await target.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
-    else:
-        await target.answer(caption, reply_markup=keyboard)
+        profile_id, name, year, group_num, faculty, photo = stranger
+        mark_stranger_viewed(user_id, profile_id)
+        caption = (
+            "🔍 <b>Анкета</b>\n"
+            f"👤 Имя: {html.escape(name or 'Не указано')}\n"
+            f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
+            f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
+            f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
+        )
+        keyboard = get_search_keyboard(profile_id)
+        if not photo:
+            continue
+        try:
+            await target.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
+            return
+        except TelegramBadRequest:
+            logger.warning("Skipping profile %s: photo is not available", profile_id)
+    await target.answer("Не удалось подобрать анкету. Попробуй позже.", reply_markup=get_main_menu())
 
 
 @router.message(F.text == "🔍 Поиск людей для общения")
@@ -228,9 +255,12 @@ async def _send_liker_profile(bot, receiver_id: int, liker_id: int, mutual: bool
         f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n\n{link}"
     )
     if photo:
-        await bot.send_photo(receiver_id, photo=photo, caption=caption)
-    else:
-        await bot.send_message(receiver_id, caption)
+        try:
+            await bot.send_photo(receiver_id, photo=photo, caption=caption)
+            return
+        except TelegramBadRequest:
+            logger.warning("Broken photo for liker %s, sending text only", liker_id)
+    await bot.send_message(receiver_id, caption)
 
 
 @router.callback_query(F.data.startswith("like_"))

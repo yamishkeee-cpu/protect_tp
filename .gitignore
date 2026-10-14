@@ -1,1 +1,6 @@
 
+dating_bot.db
+__pycache__/
+.venv/
+.env
+backup/
