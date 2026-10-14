@@ -7,3 +7,6 @@ class Anketa(StatesGroup):
     group_num = State()
     faculty = State()
     photo = State()
+
+# Включаем состояния из других файлов для удобства импорта
+# (Фактически состояния будут импортироваться из отдельных файлов в handlers)

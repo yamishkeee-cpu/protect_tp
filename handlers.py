@@ -17,7 +17,6 @@ from keyboards import (
     get_main_menu,
     get_search_keyboard,
     get_faculty_keyboard,
-    _get_faculty_keyboard_page,
     FACULTY_LIST,
 )
 from states import Anketa

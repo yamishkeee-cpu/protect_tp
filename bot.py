@@ -1,11 +1,13 @@
 import asyncio
-import os
+import html
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from handlers import router
+from temp_profile_handlers import temp_profile_router
+from events_handlers import events_router
 
 # 1. Токен бота берём из переменной окружения BOT_TOKEN (не храним в коде)
 BOT_TOKEN = "8860516710:AAFm6Jpj3-JncapVqjtzzhrPpvwggzqbsY0"
@@ -19,6 +21,8 @@ dp = Dispatcher()
 # ==================== ЗАПУСК БОТА ====================
 async def main():
     dp.include_router(router)
+    dp.include_router(temp_profile_router)
+    dp.include_router(events_router)
     print("Бот запущен и готов к работе...")
     await dp.start_polling(bot)
 
