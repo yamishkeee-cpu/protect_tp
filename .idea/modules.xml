@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/protect_tp.iml" filepath="$PROJECT_DIR$/.idea/protect_tp.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/admin_panel.iml" filepath="$PROJECT_DIR$/.idea/admin_panel.iml" />
     </modules>
   </component>
 </project>

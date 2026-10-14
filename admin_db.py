@@ -1,0 +1,763 @@
+"""Database layer for the admin panel: roles, bans, reports, journal, settings, spam limits, ads.
+
+Design notes
+* Every public function opens ONE connection and does all of its writes on it
+  (SQLite does not like nested writers from separate connections).
+* The `accounts` table itself is created in db.init_db() because the feed
+  queries in db.py / events_db.py join against it; everything else lives here.
+* The journal (`admin_actions`) is append-only: triggers reject UPDATE/DELETE.
+"""
+from __future__ import annotations
+
+import os
+import random
+import re
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from typing import Optional
+from urllib.parse import urlparse
+
+from db import db_connection
+
+PERMANENT_UNTIL = "9999-12-31 23:59:59"
+ROLE_ADMIN = "admin"
+ROLE_MODERATOR = "moderator"
+
+REPORT_REASONS = {
+    "spam": "Спам",
+    "abuse": "Оскорбления",
+    "fake": "Фейк",
+    "photo": "Неприемлемое фото",
+    "other": "Другое",
+}
+
+# key -> (title, kind, min, max). Defaults are in SETTINGS_DEFAULTS.
+SETTINGS_META = {
+    "default_registered": ("Статус новых аккаунтов (зареган / не зареган)", "bool", None, None),
+    "reports_only_registered": ("Жалобы принимаются только от зарегистрированных", "bool", None, None),
+    "reports_per_day": ("Жалоб в сутки от одного пользователя", "int", 1, 100),
+    "likes_per_hour": ("Лайков в час", "int", 1, 1000),
+    "skips_per_hour": ("Пропусков в час", "int", 1, 5000),
+    "creations_per_day": ("Создание анкет и событий в сутки", "int", 1, 100),
+    "burst_actions": ("Действий за 10 сек до временного ограничения", "int", 3, 200),
+    "restrict_minutes": ("Длительность временного ограничения, мин", "int", 1, 1440),
+}
+SETTINGS_DEFAULTS = {
+    "default_registered": "0",
+    "reports_only_registered": "0",
+    "reports_per_day": "5",
+    "likes_per_hour": "30",
+    "skips_per_hour": "100",
+    "creations_per_day": "5",
+    "burst_actions": "15",
+    "restrict_minutes": "10",
+}
+
+JOURNAL_ACTIONS = {
+    "ban_temp": "Временный бан",
+    "ban_perm": "Бан навсегда",
+    "unban": "Снятие блокировки",
+    "warn": "Предупреждение",
+    "report_dismiss": "Жалоба отклонена",
+    "status_change": "Смена статуса",
+    "setting_change": "Изменение настроек",
+    "ad_create": "Создание рекламы",
+    "ad_toggle": "Вкл/выкл рекламы",
+    "auto_restrict": "Ограничение активности",
+}
+
+
+def _now() -> str:
+    return datetime.now().isoformat(sep=" ", timespec="seconds")
+
+
+@contextmanager
+def _conn():
+    with db_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        yield conn
+
+
+# ----------------------------------------------------------------- schema
+def init_admin_db() -> None:
+    with _conn() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT NOT NULL CHECK (role IN ('admin', 'moderator')),
+                added_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                comment TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'new',          -- new | reviewed | auto_banned
+                decision TEXT,                               -- dismiss | warn | temp_ban | perm_ban | auto_ban | covered
+                moderator_id INTEGER,
+                moderator_comment TEXT NOT NULL DEFAULT '',
+                target_was_registered INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                UNIQUE (reporter_id, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reports_status ON reports (status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_reports_target ON reports (target_id, status);
+
+            CREATE TABLE IF NOT EXISTS sanctions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,                          -- warning | temp_ban | perm_ban | unban
+                reason TEXT NOT NULL DEFAULT '',
+                comment TEXT NOT NULL DEFAULT '',
+                admin_id INTEGER,                            -- NULL for automatic actions
+                source TEXT NOT NULL DEFAULT 'admin',        -- admin | auto
+                report_id INTEGER,
+                created_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sanctions_user ON sanctions (user_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS admin_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                admin_id INTEGER,                            -- NULL for automatic actions
+                source TEXT NOT NULL,                        -- admin | auto
+                action TEXT NOT NULL,
+                target_user_id INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
+                result TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_admin_actions_created ON admin_actions (created_at);
+            CREATE TRIGGER IF NOT EXISTS admin_actions_no_update
+                BEFORE UPDATE ON admin_actions
+                BEGIN SELECT RAISE(ABORT, 'admin_actions is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS admin_actions_no_delete
+                BEFORE DELETE ON admin_actions
+                BEGIN SELECT RAISE(ABORT, 'admin_actions is append-only'); END;
+
+            CREATE TABLE IF NOT EXISTS action_log (
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_action_log ON action_log (user_id, action, created_at);
+
+            CREATE TABLE IF NOT EXISTS ad_campaigns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                image TEXT,                                  -- Telegram file_id
+                url TEXT NOT NULL,
+                button_text TEXT NOT NULL,
+                every_n INTEGER NOT NULL DEFAULT 10,         -- one ad per N profiles
+                max_per_user INTEGER,                        -- NULL = unlimited
+                start_date TEXT,                             -- YYYY-MM-DD, NULL = immediately
+                end_date TEXT,                               -- YYYY-MM-DD inclusive, NULL = no end
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ad_impressions (
+                ad_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                shown_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ad_impr ON ad_impressions (ad_id, user_id);
+
+            CREATE TABLE IF NOT EXISTS ad_clicks (
+                ad_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                clicked_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ad_clicks ON ad_clicks (ad_id, user_id);
+
+            CREATE TABLE IF NOT EXISTS user_ad_state (
+                user_id INTEGER PRIMARY KEY,
+                counter INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+
+
+def sync_admins_from_env() -> None:
+    """ADMIN_IDS / MODERATOR_IDS (comma or space separated Telegram IDs) -> admins table."""
+    def parse(name: str) -> list[int]:
+        raw = os.getenv(name, "")
+        return [int(x) for x in re.split(r"[,\s;]+", raw) if x.strip().lstrip("-").isdigit()]
+
+    with _conn() as conn:
+        for role, env_name in ((ROLE_MODERATOR, "MODERATOR_IDS"), (ROLE_ADMIN, "ADMIN_IDS")):
+            # admins are written last, so an ID listed in both ends up as admin
+            for uid in parse(env_name):
+                conn.execute(
+                    "INSERT INTO admins (user_id, role, added_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET role = excluded.role",
+                    (uid, role, _now()),
+                )
+
+
+# ---------------------------------------------------------------- journal
+def _log(conn, admin_id, source, action, target_user_id=None, reason="", result="") -> None:
+    conn.execute(
+        "INSERT INTO admin_actions (created_at, admin_id, source, action, target_user_id, reason, result) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (_now(), admin_id, source, action, target_user_id, reason or "", result or ""),
+    )
+
+
+def query_journal(admin_id=None, user_id=None, action=None, date=None, page=0, page_size=8):
+    """Return (rows, total). `date` is YYYY-MM-DD."""
+    where, params = [], []
+    if admin_id is not None:
+        where.append("admin_id = ?")
+        params.append(admin_id)
+    if user_id is not None:
+        where.append("target_user_id = ?")
+        params.append(user_id)
+    if action:
+        where.append("action = ?")
+        params.append(action)
+    if date:
+        where.append("substr(created_at, 1, 10) = ?")
+        params.append(date)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with _conn() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM admin_actions{clause}", params).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM admin_actions{clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, max(0, page) * page_size],
+        ).fetchall()
+    return [dict(r) for r in rows], total
+
+
+# --------------------------------------------------------------- settings
+def _get_setting(conn, key: str) -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else SETTINGS_DEFAULTS[key]
+
+
+def get_setting(key: str) -> str:
+    with _conn() as conn:
+        return _get_setting(conn, key)
+
+
+def get_int_setting(key: str) -> int:
+    try:
+        return int(get_setting(key))
+    except ValueError:
+        return int(SETTINGS_DEFAULTS[key])
+
+
+def get_all_settings() -> dict:
+    with _conn() as conn:
+        return {key: _get_setting(conn, key) for key in SETTINGS_DEFAULTS}
+
+
+def set_setting(key: str, value: str, admin_id: int) -> None:
+    if key not in SETTINGS_META:
+        raise ValueError("Неизвестная настройка")
+    title, kind, lo, hi = SETTINGS_META[key]
+    if kind == "bool":
+        value = "1" if str(value) == "1" else "0"
+    else:
+        number = int(value)
+        if not lo <= number <= hi:
+            raise ValueError(f"Значение должно быть от {lo} до {hi}")
+        value = str(number)
+    with _conn() as conn:
+        old = _get_setting(conn, key)
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        _log(conn, admin_id, "admin", "setting_change", None, title, f"{old} → {value}")
+
+
+# ------------------------------------------------------------------ admins
+def get_admin_role(user_id: int) -> Optional[str]:
+    with _conn() as conn:
+        row = conn.execute("SELECT role FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+    return row["role"] if row else None
+
+
+def _admin_role(conn, user_id: int) -> Optional[str]:
+    row = conn.execute("SELECT role FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+    return row["role"] if row else None
+
+
+# ---------------------------------------------------------------- accounts
+def ensure_account(user_id: int) -> dict:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
+        if row:
+            return dict(row)
+        default = 1 if _get_setting(conn, "default_registered") == "1" else 0
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at) VALUES (?, ?, ?)",
+            (user_id, default, _now()),
+        )
+        return dict(conn.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone())
+
+
+def find_account(query: str) -> Optional[dict]:
+    """Find by Telegram ID first, then by internal ID."""
+    q = (query or "").strip().lstrip("#")
+    if not q.isdecimal():
+        return None
+    number = int(q)
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE user_id = ?", (number,)).fetchone()
+        if not row:
+            row = conn.execute("SELECT * FROM accounts WHERE internal_id = ?", (number,)).fetchone()
+        if row:
+            return dict(row)
+        has_profile = conn.execute(
+            "SELECT 1 FROM user_profiles WHERE user_id = ?", (number,)
+        ).fetchone()
+    return ensure_account(number) if has_profile else None
+
+
+def get_user_card(user_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            """SELECT a.*, p.name, p.start_year, p.group_num, p.faculty, p.photo
+               FROM accounts a LEFT JOIN user_profiles p ON p.user_id = a.user_id
+               WHERE a.user_id = ?""",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def active_ban(account: dict) -> Optional[dict]:
+    until = account.get("banned_until")
+    if until and until > _now():
+        return {
+            "until": until,
+            "permanent": until == PERMANENT_UNTIL,
+            "reason": account.get("ban_reason") or "",
+        }
+    return None
+
+
+def active_restriction(account: dict) -> Optional[str]:
+    until = account.get("restricted_until")
+    return until if until and until > _now() else None
+
+
+def sanction_history(user_id: int, limit: int = 10) -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sanctions WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _ensure_row(conn, user_id: int) -> None:
+    default = 1 if _get_setting(conn, "default_registered") == "1" else 0
+    conn.execute(
+        "INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at) VALUES (?, ?, ?)",
+        (user_id, default, _now()),
+    )
+
+
+def _apply_ban(conn, user_id, days, reason, comment, admin_id, source, report_id=None,
+               ban_source="admin"):
+    """days=None -> permanent. Returns the `banned_until` value."""
+    if _admin_role(conn, user_id):
+        raise ValueError("Нельзя заблокировать администратора или модератора")
+    _ensure_row(conn, user_id)
+    until = PERMANENT_UNTIL if days is None else (
+        datetime.now() + timedelta(days=days)).isoformat(sep=" ", timespec="seconds")
+    conn.execute(
+        "UPDATE accounts SET banned_until = ?, ban_source = ?, ban_reason = ? WHERE user_id = ?",
+        (until, ban_source, reason, user_id),
+    )
+    kind = "perm_ban" if days is None else "temp_ban"
+    conn.execute(
+        "INSERT INTO sanctions (user_id, kind, reason, comment, admin_id, source, report_id, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, kind, reason, comment or "", admin_id, source, report_id, _now(),
+         None if days is None else until),
+    )
+    _log(conn, admin_id, source, "ban_perm" if days is None else "ban_temp", user_id,
+         f"{reason}. {comment}".strip(". ") if comment else reason,
+         "навсегда" if days is None else f"до {until}")
+    # Other open reports against the same person are now moot.
+    conn.execute(
+        "UPDATE reports SET status = 'reviewed', decision = 'covered', reviewed_at = ?, "
+        "moderator_id = ? WHERE target_id = ? AND status = 'new' AND id <> ?",
+        (_now(), admin_id, user_id, report_id or 0),
+    )
+    return until
+
+
+def _apply_unban(conn, user_id, admin_id, source, comment="") -> bool:
+    row = conn.execute("SELECT banned_until FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
+    was_banned = bool(row and row["banned_until"] and row["banned_until"] > _now())
+    conn.execute(
+        "UPDATE accounts SET banned_until = NULL, ban_source = NULL, ban_reason = NULL WHERE user_id = ?",
+        (user_id,),
+    )
+    if was_banned:
+        conn.execute(
+            "INSERT INTO sanctions (user_id, kind, reason, comment, admin_id, source, created_at) "
+            "VALUES (?, 'unban', 'Блокировка снята', ?, ?, ?, ?)",
+            (user_id, comment or "", admin_id, source, _now()),
+        )
+        _log(conn, admin_id, source, "unban", user_id, comment or "", "блокировка снята")
+    return was_banned
+
+
+def ban_user(user_id: int, days: Optional[int], reason: str, admin_id: int, comment: str = "") -> str:
+    with _conn() as conn:
+        return _apply_ban(conn, user_id, days, reason or "Нарушение правил", comment, admin_id, "admin")
+
+
+def unban_user(user_id: int, admin_id: int, comment: str = "") -> bool:
+    with _conn() as conn:
+        return _apply_unban(conn, user_id, admin_id, "admin", comment)
+
+
+def warn_user(user_id: int, reason: str, admin_id: int, report_id: Optional[int] = None, conn=None) -> None:
+    def run(c):
+        if _admin_role(c, user_id):
+            raise ValueError("Нельзя вынести предупреждение администратору")
+        _ensure_row(c, user_id)
+        c.execute(
+            "INSERT INTO sanctions (user_id, kind, reason, admin_id, source, report_id, created_at) "
+            "VALUES (?, 'warning', ?, ?, 'admin', ?, ?)",
+            (user_id, reason, admin_id, report_id, _now()),
+        )
+        _log(c, admin_id, "admin", "warn", user_id, reason, "предупреждение")
+
+    if conn is not None:
+        run(conn)
+    else:
+        with _conn() as c:
+            run(c)
+
+
+def set_registered(user_id: int, registered: bool, admin_id: Optional[int], source: str = "admin") -> bool:
+    """Switch an account between registered / not registered.
+
+    Becoming registered lifts bans that were issued automatically for being
+    unregistered (hook for the future e-mail verification flow: call this
+    with source='auto' once the HSE e-mail is confirmed).
+    Returns True if an automatic ban was lifted.
+    """
+    with _conn() as conn:
+        _ensure_row(conn, user_id)
+        conn.execute("UPDATE accounts SET is_registered = ? WHERE user_id = ?", (1 if registered else 0, user_id))
+        _log(conn, admin_id, source, "status_change", user_id, "",
+             "зарегистрирован" if registered else "не зарегистрирован")
+        lifted = False
+        if registered:
+            row = conn.execute("SELECT ban_source FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
+            if row and row["ban_source"] == "auto_report":
+                lifted = _apply_unban(conn, user_id, admin_id, source, "Подтверждена регистрация")
+        return lifted
+
+
+def restrict_user(user_id: int, minutes: int, reason: str) -> str:
+    until = (datetime.now() + timedelta(minutes=minutes)).isoformat(sep=" ", timespec="seconds")
+    with _conn() as conn:
+        _ensure_row(conn, user_id)
+        conn.execute("UPDATE accounts SET restricted_until = ? WHERE user_id = ?", (until, user_id))
+        _log(conn, None, "auto", "auto_restrict", user_id, reason, f"до {until}")
+    return until
+
+
+# ----------------------------------------------------------------- reports
+def create_report(reporter_id: int, target_id: int, reason: str, comment: str = ""):
+    """Returns a status code:
+    invalid | not_allowed | duplicate | limit | already_banned | auto_banned | queued
+    """
+    if reporter_id == target_id or reason not in REPORT_REASONS:
+        return "invalid"
+    comment = (comment or "").strip()[:500]
+    with _conn() as conn:
+        if not conn.execute("SELECT 1 FROM user_profiles WHERE user_id = ?", (target_id,)).fetchone():
+            return "invalid"
+        if _admin_role(conn, target_id):
+            return "invalid"
+        _ensure_row(conn, reporter_id)
+        _ensure_row(conn, target_id)
+        reporter = conn.execute("SELECT is_registered FROM accounts WHERE user_id = ?", (reporter_id,)).fetchone()
+        if _get_setting(conn, "reports_only_registered") == "1" and not reporter["is_registered"]:
+            return "not_allowed"
+        if conn.execute(
+            "SELECT 1 FROM reports WHERE reporter_id = ? AND target_id = ?", (reporter_id, target_id)
+        ).fetchone():
+            return "duplicate"
+        day_ago = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
+        sent = conn.execute(
+            "SELECT COUNT(*) FROM reports WHERE reporter_id = ? AND created_at > ?", (reporter_id, day_ago)
+        ).fetchone()[0]
+        try:
+            per_day = int(_get_setting(conn, "reports_per_day"))
+        except ValueError:
+            per_day = int(SETTINGS_DEFAULTS["reports_per_day"])
+        if sent >= per_day:
+            return "limit"
+        target = conn.execute(
+            "SELECT is_registered, banned_until FROM accounts WHERE user_id = ?", (target_id,)
+        ).fetchone()
+        if target["banned_until"] and target["banned_until"] > _now():
+            return "already_banned"
+
+        registered = bool(target["is_registered"])
+        cursor = conn.execute(
+            "INSERT INTO reports (reporter_id, target_id, reason, comment, status, decision, "
+            "target_was_registered, created_at, reviewed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (reporter_id, target_id, reason, comment,
+             "new" if registered else "auto_banned",
+             None if registered else "auto_ban",
+             1 if registered else 0, _now(), None if registered else _now()),
+        )
+        report_id = cursor.lastrowid
+        if registered:
+            return "queued"
+        # Not registered: instant ban without moderation.
+        _apply_ban(conn, target_id, None, f"Жалоба #{report_id}: {REPORT_REASONS[reason]}", "",
+                   None, "auto", report_id=report_id, ban_source="auto_report")
+        return "auto_banned"
+
+
+def count_new_reports() -> int:
+    with _conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM reports WHERE status = 'new'").fetchone()[0]
+
+
+def list_reports(group: str, page: int = 0, page_size: int = 6):
+    """group: 'n' (new, oldest first) or 'd' (processed, newest first)."""
+    if group == "n":
+        where, order = "r.status = 'new'", "r.created_at ASC"
+    else:
+        where, order = "r.status <> 'new'", "r.created_at DESC"
+    with _conn() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM reports r WHERE {where}").fetchone()[0]
+        rows = conn.execute(
+            f"""SELECT r.id, r.reason, r.status, r.decision, r.target_id, tp.name AS target_name
+                FROM reports r LEFT JOIN user_profiles tp ON tp.user_id = r.target_id
+                WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?""",
+            (page_size, max(0, page) * page_size),
+        ).fetchall()
+    return [dict(r) for r in rows], total
+
+
+def get_report(report_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            """SELECT r.*, tp.name AS target_name, tp.faculty AS target_faculty,
+                      tp.start_year AS target_year, tp.group_num AS target_group,
+                      tp.photo AS target_photo, rp.name AS reporter_name,
+                      a.is_registered AS target_registered_now, a.banned_until AS target_banned_until
+               FROM reports r
+               LEFT JOIN user_profiles tp ON tp.user_id = r.target_id
+               LEFT JOIN user_profiles rp ON rp.user_id = r.reporter_id
+               LEFT JOIN accounts a ON a.user_id = r.target_id
+               WHERE r.id = ?""",
+            (report_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def resolve_report(report_id: int, admin_id: int, decision: str, moderator_comment: str = "",
+                   days: Optional[int] = None) -> Optional[dict]:
+    """decision: dismiss | warn | temp_ban | perm_ban. None if already processed."""
+    if decision not in {"dismiss", "warn", "temp_ban", "perm_ban"}:
+        raise ValueError("Неизвестное решение")
+    with _conn() as conn:
+        report = conn.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        if not report or report["status"] != "new":
+            return None
+        claimed = conn.execute(
+            "UPDATE reports SET status = 'reviewed', decision = ?, moderator_id = ?, "
+            "moderator_comment = ?, reviewed_at = ? WHERE id = ? AND status = 'new'",
+            (decision, admin_id, moderator_comment, _now(), report_id),
+        ).rowcount
+        if not claimed:
+            return None
+        target_id = report["target_id"]
+        reason = f"Жалоба #{report_id}: {REPORT_REASONS.get(report['reason'], report['reason'])}"
+        until = None
+        if decision == "dismiss":
+            _log(conn, admin_id, "admin", "report_dismiss", target_id, moderator_comment,
+                 f"жалоба #{report_id} отклонена")
+        elif decision == "warn":
+            warn_user(target_id, f"{reason}. {moderator_comment}".strip(". "), admin_id, report_id, conn=conn)
+        else:
+            until = _apply_ban(conn, target_id, None if decision == "perm_ban" else days, reason,
+                               moderator_comment, admin_id, "admin", report_id=report_id)
+        return {"target_id": target_id, "decision": decision, "until": until, "reason": reason}
+
+
+# --------------------------------------------------------------- spam guard
+_ACTION_LIMITS = {
+    "like": ("likes_per_hour", 3600, "лайков", "час"),
+    "skip": ("skips_per_hour", 3600, "пропусков", "час"),
+    "create": ("creations_per_day", 86400, "созданий анкет и событий", "сутки"),
+}
+
+
+def check_and_record_action(user_id: int, action: str) -> Optional[str]:
+    """Return a user-facing message if the limit is exceeded, otherwise record the action."""
+    if action not in _ACTION_LIMITS:
+        return None
+    key, window, label, period = _ACTION_LIMITS[action]
+    limit = get_int_setting(key)
+    since = (datetime.now() - timedelta(seconds=window)).isoformat(sep=" ", timespec="seconds")
+    with _conn() as conn:
+        used = conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE user_id = ? AND action = ? AND created_at > ?",
+            (user_id, action, since),
+        ).fetchone()[0]
+        if used >= limit:
+            return f"Достигнут лимит {label}: не более {limit} за {period}. Попробуй позже."
+        conn.execute(
+            "INSERT INTO action_log (user_id, action, created_at) VALUES (?, ?, ?)",
+            (user_id, action, _now()),
+        )
+        if random.random() < 0.02:  # cheap periodic cleanup
+            old = (datetime.now() - timedelta(days=2)).isoformat(sep=" ", timespec="seconds")
+            conn.execute("DELETE FROM action_log WHERE created_at < ?", (old,))
+    return None
+
+
+# --------------------------------------------------------------------- ads
+_SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "cutt.ly", "clck.ru", "vk.cc", "ow.ly", "rb.gy"}
+
+
+def validate_ad_url(url: str) -> Optional[str]:
+    """Return an error text, or None if the link is acceptable."""
+    url = (url or "").strip()
+    if not url or len(url) > 500 or any(ch.isspace() for ch in url):
+        return "Ссылка пустая, длиннее 500 символов или содержит пробелы."
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        credentials = bool(parsed.username or parsed.password)
+    except ValueError:
+        return "Не удалось разобрать ссылку."
+    if parsed.scheme != "https":
+        return "Допускаются только ссылки, начинающиеся с https://"
+    if not host or "." not in host:
+        return "Не удалось определить домен ссылки."
+    if credentials:
+        return "Ссылка не должна содержать логин и пароль."
+    if re.fullmatch(r"[\d.]+", host):
+        return "Ссылки на IP-адреса не допускаются."
+    if host in _SHORTENERS:
+        return "Сокращатели ссылок не допускаются: укажи прямую ссылку."
+    return None
+
+
+def create_ad(admin_id, text, image, url, button_text, every_n, max_per_user, start_date, end_date) -> int:
+    with _conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO ad_campaigns (text, image, url, button_text, every_n, max_per_user, start_date, "
+            "end_date, is_active, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (text, image, url, button_text, every_n, max_per_user, start_date, end_date, admin_id, _now()),
+        )
+        ad_id = cursor.lastrowid
+        _log(conn, admin_id, "admin", "ad_create", None, f"Реклама #{ad_id}", "создана (выключена)")
+        return ad_id
+
+
+def set_ad_active(ad_id: int, active: bool, admin_id: int) -> bool:
+    with _conn() as conn:
+        changed = conn.execute(
+            "UPDATE ad_campaigns SET is_active = ? WHERE id = ?", (1 if active else 0, ad_id)
+        ).rowcount
+        if changed:
+            _log(conn, admin_id, "admin", "ad_toggle", None, f"Реклама #{ad_id}",
+                 "включена" if active else "выключена")
+        return bool(changed)
+
+
+def get_ad(ad_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM ad_campaigns WHERE id = ?", (ad_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_ads() -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute("SELECT * FROM ad_campaigns ORDER BY id DESC LIMIT 30").fetchall()
+    return [dict(r) for r in rows]
+
+
+def ad_status_label(ad: dict) -> str:
+    today = datetime.now().date().isoformat()
+    if not ad["is_active"]:
+        return "⏸ выключена"
+    if ad["start_date"] and ad["start_date"] > today:
+        return "🕓 ждёт начала"
+    if ad["end_date"] and ad["end_date"] < today:
+        return "⌛ завершена"
+    return "▶️ идёт"
+
+
+def next_ad_for_user(user_id: int) -> Optional[dict]:
+    """Count one more profile shown to the user; return an ad if it is time for one."""
+    today = datetime.now().date().isoformat()
+    with _conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO user_ad_state (user_id, counter) VALUES (?, 0)", (user_id,))
+        conn.execute("UPDATE user_ad_state SET counter = counter + 1 WHERE user_id = ?", (user_id,))
+        counter = conn.execute("SELECT counter FROM user_ad_state WHERE user_id = ?", (user_id,)).fetchone()[0]
+        row = conn.execute(
+            """SELECT c.* FROM ad_campaigns c
+               WHERE c.is_active = 1
+                 AND (c.start_date IS NULL OR c.start_date <= ?)
+                 AND (c.end_date IS NULL OR c.end_date >= ?)
+                 AND c.every_n <= ?
+                 AND (c.max_per_user IS NULL OR
+                      (SELECT COUNT(*) FROM ad_impressions i WHERE i.ad_id = c.id AND i.user_id = ?) < c.max_per_user)
+               ORDER BY (SELECT COUNT(*) FROM ad_impressions i WHERE i.ad_id = c.id AND i.user_id = ?) ASC,
+                        RANDOM()
+               LIMIT 1""",
+            (today, today, counter, user_id, user_id),
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE user_ad_state SET counter = 0 WHERE user_id = ?", (user_id,))
+            return dict(row)
+    return None
+
+
+def record_impression(ad_id: int, user_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("INSERT INTO ad_impressions (ad_id, user_id, shown_at) VALUES (?, ?, ?)",
+                     (ad_id, user_id, _now()))
+
+
+def record_click(ad_id: int, user_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("INSERT INTO ad_clicks (ad_id, user_id, clicked_at) VALUES (?, ?, ?)",
+                     (ad_id, user_id, _now()))
+
+
+def ad_stats(ad_id: int) -> dict:
+    with _conn() as conn:
+        impressions, unique_viewers = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM ad_impressions WHERE ad_id = ?", (ad_id,)
+        ).fetchone()
+        clicks, unique_clickers = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM ad_clicks WHERE ad_id = ?", (ad_id,)
+        ).fetchone()
+    ctr = (clicks / impressions * 100) if impressions else 0.0
+    return {"impressions": impressions, "unique_viewers": unique_viewers,
+            "clicks": clicks, "unique_clickers": unique_clickers, "ctr": ctr}
+
+
+init_admin_db()

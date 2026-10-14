@@ -16,15 +16,28 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+from access_middleware import AccessMiddleware
+from admin_db import get_admin_role, init_admin_db, sync_admins_from_env
+from admin_handlers import admin_router
+from ads import ads_router
 from db import init_db
 from events_handlers import events_router
 from handlers import router as profile_router
+from report_handlers import report_router
 from temp_profile_handlers import temp_profile_router
 
 
 def build_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
-    # Order matters: profile/menu commands first, then task and event flows.
+    # Bans, temporary restrictions and spam limits apply to every message/callback.
+    access = AccessMiddleware()
+    dispatcher.message.outer_middleware(access)
+    dispatcher.callback_query.outer_middleware(access)
+    # Order matters: admin panel and complaints first, then profile/menu commands,
+    # then task and event flows.
+    dispatcher.include_router(admin_router)
+    dispatcher.include_router(report_router)
+    dispatcher.include_router(ads_router)
     dispatcher.include_router(profile_router)
     dispatcher.include_router(temp_profile_router)
     dispatcher.include_router(events_router)
@@ -41,6 +54,8 @@ async def main() -> None:
         )
 
     init_db()
+    init_admin_db()
+    sync_admins_from_env()  # ADMIN_IDS / MODERATOR_IDS -> admins table
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

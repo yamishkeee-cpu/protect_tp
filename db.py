@@ -157,6 +157,19 @@ def init_db() -> None:
                 PRIMARY KEY (user_id, event_id)
             );
 
+            -- Account status used by the admin panel (bans, registered / not registered).
+            -- banned_until: NULL = not banned, 9999-12-31 23:59:59 = permanent.
+            CREATE TABLE IF NOT EXISTS accounts (
+                internal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL UNIQUE,
+                is_registered INTEGER NOT NULL DEFAULT 0,
+                banned_until TEXT,
+                ban_source TEXT,
+                ban_reason TEXT,
+                restricted_until TEXT,
+                created_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_temp_profiles_active_expiry
                 ON temp_profiles (is_active, expires_at);
             CREATE INDEX IF NOT EXISTS idx_events_status_expiry
@@ -212,6 +225,12 @@ def init_db() -> None:
                  faculty = (SELECT p.faculty FROM user_profiles p WHERE p.user_id = users.user_id),
                  photo = (SELECT p.photo FROM user_profiles p WHERE p.user_id = users.user_id)
                WHERE EXISTS (SELECT 1 FROM user_profiles p WHERE p.user_id = users.user_id)"""
+        )
+
+        # Every existing profile gets an account row (status: not registered).
+        conn.execute(
+            """INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at)
+               SELECT user_id, 0, CURRENT_TIMESTAMP FROM user_profiles WHERE user_id IS NOT NULL"""
         )
 
         default_categories = (
@@ -290,6 +309,10 @@ def get_random_stranger(user_id: int):
                      SELECT 1 FROM viewed_profiles v
                      WHERE v.user_id = ? AND v.profile_user_id = u.user_id
                  )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM accounts a
+                     WHERE a.user_id = u.user_id AND a.banned_until > datetime('now', 'localtime')
+                 )
                ORDER BY RANDOM() LIMIT 1""",
             (user_id, user_id),
         ).fetchone()
@@ -366,6 +389,10 @@ def get_active_temp_profiles_for_search(user_id, goal_preference=None):
                WHERE tp.user_id <> ? AND tp.is_active = 1 AND tp.expires_at > ?
                  AND NOT EXISTS (
                    SELECT 1 FROM viewed_temp v WHERE v.user_id = ? AND v.temp_id = tp.id
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM accounts a
+                   WHERE a.user_id = tp.user_id AND a.banned_until > datetime('now', 'localtime')
                  )"""
     if goal_preference == "ищу_людей":
         query += " AND tp.goal = ?"

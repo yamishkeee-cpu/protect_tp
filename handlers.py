@@ -18,6 +18,7 @@ from db import (
     reset_all_viewed,
     save_user,
 )
+from ads import maybe_show_ad
 from keyboards import FACULTY_LIST, get_faculty_keyboard, get_main_menu, get_search_keyboard
 from states import Anketa
 from aiogram.types import LinkPreviewOptions
@@ -222,6 +223,7 @@ async def send_random_profile(message_or_call, user_id: int):
         keyboard = get_search_keyboard(profile_id)
         if not photo:
             continue
+        await maybe_show_ad(target, user_id)  # ad card between profiles
         try:
             await target.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
             return

@@ -117,6 +117,10 @@ def get_active_events_for_search(user_id, limit=5):
                      SELECT 1 FROM viewed_events v
                      WHERE v.user_id = ? AND v.event_id = e.id
                  )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM accounts a
+                     WHERE a.user_id = e.user_id AND a.banned_until > datetime('now', 'localtime')
+                 )
                  AND (e.people_needed IS NULL OR (
                      SELECT COUNT(*) FROM event_responses er WHERE er.event_id = e.id
                  ) < e.people_needed)
