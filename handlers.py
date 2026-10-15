@@ -6,10 +6,12 @@ from aiogram import F, Router, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
 
 from db import (
     add_like,
+    clear_interaction,
+    remove_like,
     get_random_stranger,
     get_user,
     get_user_profile,
@@ -239,28 +241,84 @@ async def start_search(message: Message, state: FSMContext):
     await send_random_profile(message, message.from_user.id)
 
 
-async def _send_liker_profile(bot, receiver_id: int, liker_id: int, mutual: bool) -> None:
-    profile = get_user_profile(liker_id) or get_user(liker_id)
+async def _get_username(bot, user_id: int) -> str | None:
+    try:
+        chat = await bot.get_chat(user_id)
+    except TelegramAPIError:
+        return None
+    return chat.username
+
+
+async def _send_profile_card(bot, receiver_id: int, profile_id: int, intro: str,
+                             contact: bool = False, reply_markup=None) -> None:
+    """Отправляет receiver_id анкету profile_id. contact=True добавляет @username."""
+    profile = get_user_profile(profile_id) or get_user(profile_id)
     if not profile:
-        await bot.send_message(receiver_id, "Кто-то поставил тебе лайк, но его профиль уже недоступен.")
+        await bot.send_message(receiver_id, "Профиль этого пользователя уже недоступен.")
         return
     name, year, group_num, faculty, photo = profile
-    link = f'<a href="tg://user?id={liker_id}">Открыть профиль в Telegram</a>'
-    intro = "💞 <b>У вас взаимная симпатия!</b>" if mutual else "❤️ <b>Кому-то понравилась твоя анкета!</b>"
     caption = (
         f"{intro}\n\n"
         f"👤 Имя: {html.escape(name or 'Не указано')}\n"
         f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
         f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
-        f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n\n{link}"
+        f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
     )
+    if contact:
+        username = await _get_username(bot, profile_id)
+        if username:
+            caption += f"\n\n✉️ Написать: @{username}"
+        else:
+            caption += (
+                "\n\n✉️ У пользователя не задан username. "
+                f'<a href="tg://user?id={profile_id}">Попробовать открыть профиль</a>'
+            )
     if photo:
         try:
-            await bot.send_photo(receiver_id, photo=photo, caption=caption)
+            await bot.send_photo(receiver_id, photo=photo, caption=caption, reply_markup=reply_markup)
             return
         except TelegramBadRequest:
-            logger.warning("Broken photo for liker %s, sending text only", liker_id)
-    await bot.send_message(receiver_id, caption)
+            logger.warning("Broken photo for profile %s, sending text only", profile_id)
+    await bot.send_message(receiver_id, caption, reply_markup=reply_markup)
+
+
+def _reply_keyboard(liker_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❤️ Лайк в ответ", callback_data=f"likeback_{liker_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{liker_id}"),
+    ]])
+
+
+async def _notify_match(bot, liker_id: int, responder_id: int) -> None:
+    """Взаимная симпатия: обе стороны получают анкету и @username друг друга.
+    После успешной отправки информация о матче (лайки в обе стороны) удаляется из базы."""
+    delivered = True
+    try:
+        await _send_profile_card(bot, responder_id, liker_id, "💞 <b>Взаимная симпатия!</b>", contact=True)
+    except TelegramAPIError:
+        delivered = False
+        logger.info("Could not send contact to the responder %s", responder_id)
+    try:
+        await _send_profile_card(
+            bot, liker_id, responder_id,
+            "💞 <b>Ты понравился этому человеку в ответ!</b>\nУ вас взаимная симпатия.",
+            contact=True,
+        )
+    except TelegramAPIError:
+        delivered = False
+        logger.info("Could not notify the first liker %s", liker_id)
+    if delivered:
+        remove_like(liker_id, responder_id)
+        remove_like(responder_id, liker_id)
+    # если кому-то не дошло (например, заблокировал бота), лайки остаются,
+    # и следующий лайк повторит отправку
+
+
+async def _remove_buttons(call: types.CallbackQuery) -> None:
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
 
 
 @router.callback_query(F.data.startswith("like_"))
@@ -270,28 +328,66 @@ async def like_callback(call: types.CallbackQuery):
     except (ValueError, IndexError):
         await call.answer("Некорректная анкета", show_alert=True)
         return
-    if stranger_id == call.from_user.id or not get_user_profile(stranger_id):
+    me = call.from_user.id
+    if stranger_id == me or not get_user_profile(stranger_id):
         await call.answer("Эта анкета уже недоступна", show_alert=True)
         return
-    reciprocal = has_like(stranger_id, call.from_user.id)
-    is_new_like = add_like(call.from_user.id, stranger_id)
-    await call.answer("Лайк отправлен" if is_new_like else "Ты уже ставил лайк этой анкете")
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramAPIError:
-        pass
-    if is_new_like:
+    already = has_like(me, stranger_id)
+    reciprocal = has_like(stranger_id, me)
+    add_like(me, stranger_id)  # если лайк уже есть, ничего не меняется
+    await _remove_buttons(call)
+
+    if reciprocal:
+        # Этот человек лайкал нас раньше: взаимная симпатия, данные о матче удаляются из базы
+        await call.answer("Взаимная симпатия!")
+        await _notify_match(call.bot, stranger_id, me)
+    else:
+        # Первый лайк или повторный (на прошлый не ответили): человеку приходит запрос
+        await call.answer("Лайк отправлен снова" if already else "Лайк отправлен")
         try:
-            await _send_liker_profile(call.bot, stranger_id, call.from_user.id, reciprocal)
+            await _send_profile_card(
+                call.bot, stranger_id, me,
+                "❤️ <b>Ты понравился этому человеку!</b>\n"
+                "Лайкни в ответ, чтобы получить его контакт, или отклони.",
+                reply_markup=_reply_keyboard(me),
+            )
         except TelegramAPIError:
             logger.info("Could not notify the liked user about a like")
-        if reciprocal:
-            try:
-                await _send_liker_profile(call.bot, call.from_user.id, stranger_id, True)
-            except TelegramAPIError:
-                logger.info("Could not notify the current user about a mutual like")
     await call.message.answer("❤️ Лайк обработан. Показываю следующую анкету…")
-    await send_random_profile(call, call.from_user.id)
+    await send_random_profile(call, me)
+
+
+@router.callback_query(F.data.startswith("likeback_"))
+async def likeback_callback(call: types.CallbackQuery):
+    try:
+        liker_id = int(call.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная анкета", show_alert=True)
+        return
+    me = call.from_user.id
+    await _remove_buttons(call)
+    if not has_like(liker_id, me) or not get_user_profile(liker_id):
+        await call.answer("Этот лайк уже недоступен", show_alert=True)
+        return
+    if not add_like(me, liker_id):
+        await call.answer("Ты уже ответил на этот лайк")
+        return
+    await call.answer("Взаимная симпатия!")
+    await _notify_match(call.bot, liker_id, me)
+
+
+@router.callback_query(F.data.startswith("reject_"))
+async def reject_callback(call: types.CallbackQuery):
+    # Отказ: из базы стирается всё, что связывает двоих (лайки и просмотры),
+    # как будто они не взаимодействовали. Тому, кто лайкнул, ничего не отправляется.
+    try:
+        liker_id = int(call.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    clear_interaction(call.from_user.id, liker_id)
+    await _remove_buttons(call)
+    await call.answer("Анкета отклонена")
 
 
 @router.callback_query(F.data.startswith("dislike_"))
