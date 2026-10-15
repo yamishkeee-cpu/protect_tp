@@ -14,6 +14,7 @@ from db import (
     remove_like,
     get_random_stranger,
     get_user,
+    get_user_bio,
     get_user_profile,
     has_like,
     mark_stranger_viewed,
@@ -135,14 +136,25 @@ async def faculty_callback(call: types.CallbackQuery, state: FSMContext):
         return
     await state.update_data(faculty=FACULTY_LIST[index])
     await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("Отправь одну свою фотографию:")
-    await state.set_state(Anketa.photo)
+    await call.message.answer("Расскажи немного о себе: интересы, увлечения, кого хочешь найти (до 300 символов).")
+    await state.set_state(Anketa.bio)
     await call.answer()
 
 
 @router.message(Anketa.faculty)
 async def process_faculty_direct(message: Message):
     await message.answer("Пожалуйста, выбери направление кнопкой ниже:", reply_markup=get_faculty_keyboard())
+
+
+@router.message(Anketa.bio)
+async def process_bio(message: Message, state: FSMContext):
+    bio = (message.text or "").strip()
+    if not bio or len(bio) > 300:
+        await message.answer("Введи био текстом длиной от 1 до 300 символов.")
+        return
+    await state.update_data(bio=bio)
+    await message.answer("Отправь одну свою фотографию:")
+    await state.set_state(Anketa.photo)
 
 
 @router.message(Anketa.photo)
@@ -160,6 +172,7 @@ async def process_photo(message: Message, state: FSMContext):
             group_num=data["group_num"],
             faculty=data["faculty"],
             photo=photo_id,
+            bio=data["bio"],
         )
     except Exception:
         logger.exception("Failed to save permanent profile for user %s", message.from_user.id)
@@ -181,7 +194,8 @@ async def show_my_profile(message: Message, state: FSMContext):
         f"👤 Имя: {html.escape(name or 'Не указано')}\n"
         f"📅 Год поступления: {html.escape(start_year or 'Не указан')}\n"
         f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
-        f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
+        f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n"
+        f"📝 О себе: {html.escape(get_user_bio(message.from_user.id) or 'Не указано')}"
     )
     if photo:
         try:
@@ -190,7 +204,8 @@ async def show_my_profile(message: Message, state: FSMContext):
         except TelegramBadRequest:
             # Фото устарело (например, сменился бот): просим загрузить заново, остальные данные оставляем
             logger.warning("Broken photo file_id for user %s", message.from_user.id)
-            await state.update_data(name=name, start_year=start_year, group_num=group_num, faculty=faculty)
+            await state.update_data(name=name, start_year=start_year, group_num=group_num, faculty=faculty,
+                                    bio=get_user_bio(message.from_user.id))
             await state.set_state(Anketa.photo)
             await message.answer("Твоё фото больше не открывается. Отправь, пожалуйста, новую фотографию:",
                                  reply_markup=ReplyKeyboardRemove())
@@ -219,7 +234,8 @@ async def send_random_profile(message_or_call, user_id: int):
             f"👤 Имя: {html.escape(name or 'Не указано')}\n"
             f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
             f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
-            f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
+            f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n"
+            f"📝 О себе: {html.escape(get_user_bio(profile_id) or 'Не указано')}"
         )
         keyboard = get_search_keyboard(profile_id)
         if not photo:
@@ -262,7 +278,8 @@ async def _send_profile_card(bot, receiver_id: int, profile_id: int, intro: str,
         f"👤 Имя: {html.escape(name or 'Не указано')}\n"
         f"📅 Год поступления: {html.escape(year or 'Не указан')}\n"
         f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
-        f"🎓 Направление: {html.escape(faculty or 'Не указано')}"
+        f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n"
+        f"📝 О себе: {html.escape(get_user_bio(profile_id) or 'Не указано')}"
     )
     if contact:
         username = await _get_username(bot, profile_id)
