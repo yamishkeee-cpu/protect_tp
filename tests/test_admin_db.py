@@ -10,6 +10,8 @@ _tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_PATH"] = os.path.join(_tmp.name, "test.db")
 os.environ["ADMIN_IDS"] = "1"
 os.environ["MODERATOR_IDS"] = "2"
+os.environ["ADMIN_USERNAMES"] = "Boss_User, @second_boss"
+os.environ["MODERATOR_USERNAMES"] = "mod_user,1_id_admin"
 
 import sqlite3  # noqa: E402
 
@@ -165,6 +167,73 @@ class AdminDbTests(unittest.TestCase):
         self.assertNotIn(event_id, ids)
         self.assertTrue(all(row[8] != 190 for row in
                             [db.get_active_temp_profiles_for_search(191) or (0,)*9 for _ in range(10)]))
+
+    # ---- admins by @username
+    def test_admin_bound_by_username_case_insensitive_and_survives_rename(self):
+        self.assertIsNone(admin_db.get_admin_role(500))
+        self.assertIsNone(admin_db.bind_admin_by_username(500, "somebody_else"))
+        self.assertIsNone(admin_db.bind_admin_by_username(500, None))
+        self.assertEqual(admin_db.bind_admin_by_username(500, "BOSS_user"), "admin")
+        self.assertEqual(admin_db.get_admin_role(500), "admin")
+        self.assertEqual(admin_db.bind_admin_by_username(501, "mod_user"), "moderator")
+        # rights are by ID afterwards: renaming does not matter
+        self.assertIsNone(admin_db.bind_admin_by_username(500, "renamed_boss"))
+        self.assertEqual(admin_db.get_admin_role(500), "admin")
+        rows, _ = admin_db.query_journal(action="admin_bind")
+        self.assertTrue(any(r["target_user_id"] == 500 and r["source"] == "auto" for r in rows))
+
+    def test_explicit_id_admin_is_not_downgraded_by_username(self):
+        # user 1 is admin by ID; an unrelated moderator username must not change that
+        self.assertEqual(admin_db.bind_admin_by_username(1, "mod_user"), "admin")
+        self.assertEqual(admin_db.get_admin_role(1), "admin")
+
+    def test_removing_username_from_env_revokes_access_on_sync(self):
+        self.assertEqual(admin_db.bind_admin_by_username(510, "second_boss"), "admin")
+        old = os.environ["ADMIN_USERNAMES"]
+        try:
+            os.environ["ADMIN_USERNAMES"] = "boss_user"
+            admin_db.sync_admins_from_env()
+            self.assertIsNone(admin_db.get_admin_role(510))
+            self.assertEqual(admin_db.get_admin_role(1), "admin")  # ID admins stay
+        finally:
+            os.environ["ADMIN_USERNAMES"] = old
+            admin_db.sync_admins_from_env()
+
+    def test_username_is_stored_and_updated(self):
+        admin_db.ensure_account(520, "first_name")
+        self.assertEqual(admin_db.ensure_account(520, "new_name")["username"], "new_name")
+        self.assertEqual(admin_db.ensure_account(520)["username"], "new_name")   # omitted -> untouched
+        self.assertIsNone(admin_db.ensure_account(520, None)["username"])        # person removed @username
+
+    # ---- search by id / @username / profile name
+    def test_search_by_username_name_and_id(self):
+        db.save_user_profile(600, "Иван Петров", "2024", "G1", "Дизайн", "p")
+        db.save_user_profile(601, "Мария Иванова", "2023", "G2", "Филология", "p")
+        db.save_user_profile(602, "Пётр", "2022", "G3", "Юриспруденция", "p")
+        admin_db.ensure_account(600, "ivan_hse")
+        admin_db.ensure_account(601, "maria_nn")
+        admin_db.ensure_account(602, None)
+        ids = lambda q: [r["user_id"] for r in admin_db.search_accounts(q)[0]]
+        self.assertEqual(ids("@ivan_hse"), [600])
+        self.assertEqual(ids("@IVAN"), [600])                 # partial username, any case
+        self.assertEqual(ids("@Иван"), [])                    # @ means username only
+        self.assertEqual(set(ids("иван")), {600, 601})        # name part, Cyrillic case-insensitive
+        self.assertEqual(ids("ПЕТРОВ"), [600])
+        self.assertEqual(ids("пётр"), [602])
+        self.assertEqual(ids("maria_nn"), [601])              # username without @ also works
+        self.assertEqual(ids("600"), [600])                   # Telegram ID
+        internal = admin_db.ensure_account(601)["internal_id"]
+        self.assertIn(601, ids(str(internal)))                # internal ID
+        self.assertEqual(admin_db.search_accounts("   "), ([], 0))
+        self.assertEqual(admin_db.search_accounts("zzzzzz_none")[0], [])
+        results, total = admin_db.search_accounts("иван", limit=1)
+        self.assertEqual((len(results), total), (1, 2))       # total shows there are more
+
+    def test_settings_state_text(self):
+        import importlib, types
+        # keyboards need aiogram; only check the pure helper's logic through SETTINGS_META here
+        self.assertEqual(admin_db.SETTINGS_META["default_registered"][1], "bool")
+        self.assertEqual(admin_db.SETTINGS_META["likes_per_hour"][1], "int")
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ JOURNAL_ACTIONS = {
     "ad_create": "Создание рекламы",
     "ad_toggle": "Вкл/выкл рекламы",
     "auto_restrict": "Ограничение активности",
+    "admin_bind": "Назначение админа по username",
 }
 
 
@@ -87,7 +88,15 @@ def init_admin_db() -> None:
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
                 role TEXT NOT NULL CHECK (role IN ('admin', 'moderator')),
-                added_at TEXT NOT NULL
+                added_at TEXT NOT NULL,
+                username TEXT,                               -- lowercase, set when bound by username
+                source TEXT NOT NULL DEFAULT 'id'            -- id (ADMIN_IDS) | username (ADMIN_USERNAMES)
+            );
+
+            -- Usernames from .env waiting for the person to write to the bot once.
+            CREATE TABLE IF NOT EXISTS admin_usernames (
+                username TEXT PRIMARY KEY,                   -- lowercase, without @
+                role TEXT NOT NULL CHECK (role IN ('admin', 'moderator'))
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -189,21 +198,95 @@ def init_admin_db() -> None:
         )
 
 
+        # Migrations for databases created by earlier versions of the admin panel.
+        def columns(table):
+            return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+        if "username" not in columns("accounts"):
+            conn.execute("ALTER TABLE accounts ADD COLUMN username TEXT")
+        if "username" not in columns("admins"):
+            conn.execute("ALTER TABLE admins ADD COLUMN username TEXT")
+        if "source" not in columns("admins"):
+            conn.execute("ALTER TABLE admins ADD COLUMN source TEXT NOT NULL DEFAULT 'id'")
+
+
+_USERNAME_RE = re.compile(r"^[a-z0-9_]{3,32}$")
+
+
+def _parse_usernames(env_name: str) -> list[str]:
+    raw = os.getenv(env_name, "")
+    names = (x.strip().lstrip("@").lower() for x in re.split(r"[,\s;]+", raw))
+    return [n for n in names if _USERNAME_RE.match(n)]
+
+
 def sync_admins_from_env() -> None:
-    """ADMIN_IDS / MODERATOR_IDS (comma or space separated Telegram IDs) -> admins table."""
-    def parse(name: str) -> list[int]:
+    """Read admins from .env.
+
+    ADMIN_USERNAMES / MODERATOR_USERNAMES  - Telegram @usernames (main way). The person is
+        bound to the role the first time they write to the bot (see bind_admin_by_username).
+        .env is the source of truth: removing a name and restarting revokes the access.
+    ADMIN_IDS / MODERATOR_IDS              - optional fallback by numeric Telegram ID.
+    """
+    def parse_ids(name: str) -> list[int]:
         raw = os.getenv(name, "")
         return [int(x) for x in re.split(r"[,\s;]+", raw) if x.strip().lstrip("-").isdigit()]
 
     with _conn() as conn:
+        # -- usernames: replace the waiting list; admin wins if a name is in both lists
+        conn.execute("DELETE FROM admin_usernames")
+        for role, env_name in ((ROLE_MODERATOR, "MODERATOR_USERNAMES"), (ROLE_ADMIN, "ADMIN_USERNAMES")):
+            for name in _parse_usernames(env_name):
+                conn.execute(
+                    "INSERT INTO admin_usernames (username, role) VALUES (?, ?) "
+                    "ON CONFLICT(username) DO UPDATE SET role = excluded.role",
+                    (name, role),
+                )
+        # revoke / re-role people who were bound by username earlier
+        conn.execute(
+            "DELETE FROM admins WHERE source = 'username' "
+            "AND (username IS NULL OR username NOT IN (SELECT username FROM admin_usernames))"
+        )
+        conn.execute(
+            "UPDATE admins SET role = (SELECT role FROM admin_usernames u WHERE u.username = admins.username) "
+            "WHERE source = 'username'"
+        )
+        # -- numeric IDs (fallback)
         for role, env_name in ((ROLE_MODERATOR, "MODERATOR_IDS"), (ROLE_ADMIN, "ADMIN_IDS")):
             # admins are written last, so an ID listed in both ends up as admin
-            for uid in parse(env_name):
+            for uid in parse_ids(env_name):
                 conn.execute(
-                    "INSERT INTO admins (user_id, role, added_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(user_id) DO UPDATE SET role = excluded.role",
+                    "INSERT INTO admins (user_id, role, added_at, source) VALUES (?, ?, ?, 'id') "
+                    "ON CONFLICT(user_id) DO UPDATE SET role = excluded.role, source = 'id'",
                     (uid, role, _now()),
                 )
+
+
+def bind_admin_by_username(user_id: int, username) -> Optional[str]:
+    """Called for every incoming update. If this @username is in ADMIN_USERNAMES /
+    MODERATOR_USERNAMES, remember the person's Telegram ID with that role.
+    Afterwards rights are checked by ID, so a later username change does not matter.
+    Returns the role or None."""
+    name = (username or "").lstrip("@").lower()
+    if not name:
+        return None
+    with _conn() as conn:
+        wanted = conn.execute("SELECT role FROM admin_usernames WHERE username = ?", (name,)).fetchone()
+        if not wanted:
+            return None
+        existing = conn.execute("SELECT role, source FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+        if existing and existing["source"] == "id":
+            return existing["role"]          # an explicit ID entry is never touched
+        if existing:
+            if existing["role"] != wanted["role"]:
+                conn.execute("UPDATE admins SET role = ?, username = ? WHERE user_id = ?",
+                             (wanted["role"], name, user_id))
+            return wanted["role"]
+        conn.execute(
+            "INSERT INTO admins (user_id, role, added_at, username, source) VALUES (?, ?, ?, ?, 'username')",
+            (user_id, wanted["role"], _now(), name),
+        )
+        _log(conn, None, "auto", "admin_bind", user_id, f"@{name}", f"роль: {wanted['role']}")
+        return wanted["role"]
 
 
 # ---------------------------------------------------------------- journal
@@ -297,15 +380,26 @@ def _admin_role(conn, user_id: int) -> Optional[str]:
 
 
 # ---------------------------------------------------------------- accounts
-def ensure_account(user_id: int) -> dict:
+_UNSET = object()
+
+
+def ensure_account(user_id: int, username=_UNSET) -> dict:
+    """Return the account row, creating it if needed.
+
+    Pass `username` (str, or None when the person has no @username) to keep the stored
+    username fresh; omit it to leave the stored value untouched."""
+    clean = None if username is _UNSET or not username else str(username).lstrip("@")
     with _conn() as conn:
         row = conn.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
         if row:
+            if username is not _UNSET and row["username"] != clean:
+                conn.execute("UPDATE accounts SET username = ? WHERE user_id = ?", (clean, user_id))
+                row = conn.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
             return dict(row)
         default = 1 if _get_setting(conn, "default_registered") == "1" else 0
         conn.execute(
-            "INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at) VALUES (?, ?, ?)",
-            (user_id, default, _now()),
+            "INSERT OR IGNORE INTO accounts (user_id, is_registered, username, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, default, clean, _now()),
         )
         return dict(conn.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone())
 
@@ -326,6 +420,49 @@ def find_account(query: str) -> Optional[dict]:
             "SELECT 1 FROM user_profiles WHERE user_id = ?", (number,)
         ).fetchone()
     return ensure_account(number) if has_profile else None
+
+
+def search_accounts(query: str, limit: int = 10) -> tuple[list[dict], int]:
+    """Find people by Telegram ID / internal ID, @username or name from the profile.
+
+    Returns (results, total_matches). A query starting with @ searches usernames only;
+    any other text is matched against both the username and the profile name
+    (case-insensitive, substring). Exact matches come first."""
+    q = (query or "").strip()
+    if not q:
+        return [], 0
+    if q.lstrip("#").isdecimal():
+        account = find_account(q)
+        if not account:
+            return [], 0
+        card = get_user_card(account["user_id"])
+        return [card], 1
+    username_only = q.startswith("@")
+    needle = q.lstrip("@").casefold()
+    if not needle:
+        return [], 0
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT a.user_id, a.internal_id, a.username, p.name
+               FROM accounts a LEFT JOIN user_profiles p ON p.user_id = a.user_id"""
+        ).fetchall()
+    scored = []
+    for row in rows:
+        username = (row["username"] or "").casefold()
+        name = (row["name"] or "").casefold()
+        if username == needle:
+            rank = 0
+        elif not username_only and name == needle:
+            rank = 1
+        elif username and needle in username:
+            rank = 2
+        elif not username_only and needle in name:
+            rank = 3
+        else:
+            continue
+        scored.append((rank, name, dict(row)))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in scored[:limit]], len(scored)
 
 
 def get_user_card(user_id: int) -> Optional[dict]:

@@ -1,4 +1,3 @@
-from __future__ import annotations
 """Ban check, temporary restrictions and spam limits for every incoming message/callback."""
 import logging
 import time
@@ -62,11 +61,14 @@ class AccessMiddleware(BaseMiddleware):
         if user is None or user.is_bot:
             return await handler(event, data)
 
+        # Keep the @username fresh (it makes the person searchable in the admin panel) and
+        # turn an @username from ADMIN_USERNAMES / MODERATOR_USERNAMES into a role.
+        account = admin_db.ensure_account(user.id, user.username)
+        admin_db.bind_admin_by_username(user.id, user.username)
+
         # Admins and moderators are never banned or rate-limited.
         if admin_db.get_admin_role(user.id):
             return await handler(event, data)
-
-        account = admin_db.ensure_account(user.id)
 
         ban = admin_db.active_ban(account)
         if ban:

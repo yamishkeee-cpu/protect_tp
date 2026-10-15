@@ -79,13 +79,46 @@ def confirm_kb(yes_cb: str, yes_text: str = "✅ Подтвердить", no_cb:
                                     Btn(text="❌ Отмена", callback_data=no_cb)]])
 
 
+SETTING_SHORT = {
+    "default_registered": "Новый аккаунт при входе",
+    "reports_only_registered": "Жалобы только от зарегистрированных",
+    "reports_per_day": "Жалоб в сутки от одного человека",
+    "likes_per_hour": "Лайков в час",
+    "skips_per_hour": "Пропусков в час",
+    "creations_per_day": "Создание анкет и событий в сутки",
+    "burst_actions": "Действий за 10 сек до ограничения",
+    "restrict_minutes": "Длительность ограничения, мин",
+}
+
+
+def setting_state_text(key: str, value: str) -> str:
+    """Human-readable current state of a setting (used on buttons and in pop-up answers)."""
+    if key == "default_registered":
+        return "✅ ЗАРЕГАН" if value == "1" else "🕓 НЕ ЗАРЕГАН"
+    if SETTINGS_META[key][1] == "bool":
+        return "🟢 ВКЛ" if value == "1" else "🔴 ВЫКЛ"
+    return value
+
+
 def settings_kb(values: dict) -> Markup:
+    """The current state is the first thing on every button: [state] name.
+    Switches flip on tap; numeric items open an input prompt (✏️)."""
     rows = []
-    for key, (title, kind, _lo, _hi) in SETTINGS_META.items():
-        value = values[key]
-        shown = ("✅ зареган" if value == "1" else "🕓 не зареган") if key == "default_registered" else (
-            ("вкл" if value == "1" else "выкл") if kind == "bool" else value)
-        rows.append([Btn(text=f"{title}: {shown}"[:64], callback_data=f"adm:setv:{key}")])
+    for key, (_title, kind, _lo, _hi) in SETTINGS_META.items():
+        state = setting_state_text(key, values[key])
+        label = f"{state} · {SETTING_SHORT[key]}" if kind == "bool" else f"✏️ {SETTING_SHORT[key]}: {state}"
+        rows.append([Btn(text=label, callback_data=f"adm:setv:{key}")])
+    rows.append(BACK_TO_MENU)
+    return Markup(inline_keyboard=rows)
+
+
+def search_results_kb(results) -> Markup:
+    rows = []
+    for item in results:
+        name = item.get("name") or "без анкеты"
+        tag = f" · @{item['username']}" if item.get("username") else ""
+        rows.append([Btn(text=f"{name}{tag} · {item['user_id']}"[:60], callback_data=f"adm:u:{item['user_id']}")])
+    rows.append([Btn(text="🔎 Искать ещё", callback_data="adm:users")])
     rows.append(BACK_TO_MENU)
     return Markup(inline_keyboard=rows)
 

@@ -60,6 +60,10 @@ async def main() -> None:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not any(os.getenv(name, "").strip() for name in
+               ("ADMIN_USERNAMES", "MODERATOR_USERNAMES", "ADMIN_IDS", "MODERATOR_IDS")):
+        logging.getLogger(__name__).warning(
+            "Админы не заданы: укажи ADMIN_USERNAMES (или ADMIN_IDS) в .env, иначе /admin недоступен")
     dispatcher = build_dispatcher()
     async with Bot(
         token=token,

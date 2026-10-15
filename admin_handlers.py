@@ -22,8 +22,10 @@ import admin_db
 from admin_db import JOURNAL_ACTIONS, PERMANENT_UNTIL, REPORT_REASONS, ROLE_ADMIN, SETTINGS_META
 from admin_keyboards import (
     ad_card_kb, ad_create_confirm_kb, ads_list_kb, cancel_kb, confirm_kb, journal_kb,
-    journal_types_kb, menu_kb, report_card_kb, reports_list_kb, settings_kb, skip_kb, user_card_kb,
+    journal_types_kb, menu_kb, report_card_kb, reports_list_kb, search_results_kb, setting_state_text,
+    settings_kb, skip_kb, user_card_kb,
 )
+from admin_keyboards import SETTING_SHORT
 from admin_states import AdCreate, AdminFlow
 from ads import send_ad_card
 
@@ -153,6 +155,7 @@ def _user_card_text(card: dict) -> str:
         "👤 <b>Пользователь</b>",
         f"Telegram ID: <code>{card['user_id']}</code>",
         f"Внутренний ID: <code>{card['internal_id']}</code>",
+        f"Username: {'@' + html.escape(card['username']) if card.get('username') else '—'}",
         f"Имя: {esc(card.get('name'))}",
         f"Направление: {esc(card.get('faculty'))}",
         f"Год поступления: {esc(card.get('start_year'))} · группа: {esc(card.get('group_num'))}",
@@ -183,23 +186,34 @@ async def _send_user_card(target: Message, user_id: int, role: str) -> None:
 async def cb_users(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminFlow.user_search)
     await call.answer()
-    await _show(call, "👥 <b>Пользователи</b>\n\nВведи Telegram ID или внутренний ID пользователя.",
+    await _show(call, "👥 <b>Пользователи</b>\n\nВведи для поиска:\n"
+                      "• Telegram ID или внутренний ID,\n"
+                      "• @username из Telegram,\n"
+                      "• имя из анкеты (можно часть имени).\n\n"
+                      "<i>Username известен только тем, кто писал боту после обновления.</i>",
                 cancel_kb())
 
 
 @admin_router.message(StateFilter(AdminFlow.user_search))
 async def msg_user_search(message: Message, state: FSMContext):
-    account = admin_db.find_account(message.text or "")
-    if not account:
-        await message.answer("Не нашёл такого пользователя. Введи число (ID) ещё раз или нажми «Отмена».",
+    results, total = admin_db.search_accounts(message.text or "")
+    if not results:
+        await message.answer("Никого не нашёл. Попробуй другой запрос: ID, @username или имя из анкеты.",
                              reply_markup=cancel_kb())
         return
+    if len(results) == 1:
+        await state.clear()
+        await _send_user_card(message, results[0]["user_id"], _role(message.from_user.id))
+        return
     await state.clear()
-    await _send_user_card(message, account["user_id"], _role(message.from_user.id))
+    more = f" (показаны первые {len(results)}, уточни запрос)" if total > len(results) else ""
+    await message.answer(f"Нашёл совпадений: {total}{more}. Выбери человека:",
+                         reply_markup=search_results_kb(results))
 
 
 @admin_router.callback_query(F.data.startswith("adm:u:"))
-async def cb_user_card(call: types.CallbackQuery):
+async def cb_user_card(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
     try:
         uid = int(call.data.split(":")[2])
     except (ValueError, IndexError):
@@ -236,7 +250,8 @@ async def cb_toggle_registered(call: types.CallbackQuery):
     _, _, uid_raw, value = call.data.split(":")
     uid, registered = int(uid_raw), value == "1"
     lifted = admin_db.set_registered(uid, registered, call.from_user.id)
-    await call.answer("Статус изменён")
+    await call.answer("Теперь: ✅ зарегистрирован" if registered else "Теперь: 🕓 не зарегистрирован",
+                      show_alert=True)
     if lifted:
         await _notify_user(call.bot, uid, "✅ Регистрация подтверждена, блокировка снята.")
     await _send_user_card(call.message, uid, ROLE_ADMIN)
@@ -428,11 +443,18 @@ async def cb_report_card(call: types.CallbackQuery):
 
 # ---------------------------------------------------------------- settings
 def _settings_text() -> str:
+    values = admin_db.get_all_settings()
+    registered = "✅ зарегистрирован" if values["default_registered"] == "1" else "🕓 не зарегистрирован"
+    only = "🟢 вкл" if values["reports_only_registered"] == "1" else "🔴 выкл"
     return ("⚙️ <b>Настройки</b>\n\n"
-            "Нажми на пункт, чтобы изменить значение.\n"
-            "• Статус новых аккаунтов — «зареган» или «не зареган» при первом входе. "
-            "Не зарегистрированным аккаунтам бан по жалобе выдаётся автоматически.\n"
-            "• Лимиты защищают от спама; при слишком частых действиях доступ ограничивается на время.")
+            "Состояние каждого пункта написано на кнопке. Переключатели (🟢/🔴, ✅/🕓) меняются "
+            "одним нажатием, у пунктов с ✏️ бот спросит новое число.\n\n"
+            "<b>Сейчас:</b>\n"
+            f"• Новый аккаунт при первом входе: {registered}\n"
+            f"• Жалобы принимаются только от зарегистрированных: {only}\n\n"
+            "ℹ️ Не зарегистрированному аккаунту бан по жалобе выдаётся автоматически, "
+            "по зарегистрированному решает модератор. Лимиты защищают от спама: при слишком "
+            "частых действиях доступ ограничивается на время.")
 
 
 @admin_router.callback_query(F.data == "adm:set")
@@ -456,8 +478,9 @@ async def cb_setting_change(call: types.CallbackQuery, state: FSMContext):
     title, kind, lo, hi = SETTINGS_META[key]
     if kind == "bool":
         current = admin_db.get_setting(key)
-        admin_db.set_setting(key, "0" if current == "1" else "1", call.from_user.id)
-        await call.answer("Сохранено")
+        new_value = "0" if current == "1" else "1"
+        admin_db.set_setting(key, new_value, call.from_user.id)
+        await call.answer(f"{SETTING_SHORT[key]}: теперь {setting_state_text(key, new_value)}", show_alert=True)
         await _show(call, _settings_text(), settings_kb(admin_db.get_all_settings()))
         return
     await state.set_state(AdminFlow.setting_value)
