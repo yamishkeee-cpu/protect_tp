@@ -279,7 +279,7 @@ def get_user_profile(user_id: int):
 
 
 def get_random_stranger(user_id: int):
-    """Get a profile the requesting user has not viewed yet."""
+    """Следующая анкета по порядку регистрации (по времени создания профиля), которую пользователь ещё не смотрел."""
     with db_connection() as conn:
         return conn.execute(
             """SELECT u.user_id, u.name, u.start_year, u.group_num, u.faculty, u.photo
@@ -290,7 +290,9 @@ def get_random_stranger(user_id: int):
                      SELECT 1 FROM viewed_profiles v
                      WHERE v.user_id = ? AND v.profile_user_id = u.user_id
                  )
-               ORDER BY RANDOM() LIMIT 1""",
+               ORDER BY (SELECT p.created_at FROM user_profiles p WHERE p.user_id = u.user_id),
+                        u.user_id
+               LIMIT 1""",
             (user_id, user_id),
         ).fetchone()
 
@@ -327,6 +329,15 @@ def add_like(user_id: int, liked_user_id: int) -> bool:
             (user_id, liked_user_id),
         )
         return cursor.rowcount > 0
+
+
+def remove_like(user_id: int, liked_user_id: int) -> None:
+    """Убирает лайк (например, когда на него ответили отказом)."""
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM user_likes WHERE user_id = ? AND liked_user_id = ?",
+            (user_id, liked_user_id),
+        )
 
 
 def has_like(user_id: int, liked_user_id: int) -> bool:
