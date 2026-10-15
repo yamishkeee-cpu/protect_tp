@@ -340,6 +340,22 @@ def remove_like(user_id: int, liked_user_id: int) -> None:
         )
 
 
+def clear_interaction(user_a: int, user_b: int) -> None:
+    """Стирает всё, что связывает двух пользователей, как будто они не взаимодействовали:
+    лайки в обе стороны и отметки «просмотрено» в обе стороны."""
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM user_likes WHERE (user_id = ? AND liked_user_id = ?) "
+            "OR (user_id = ? AND liked_user_id = ?)",
+            (user_a, user_b, user_b, user_a),
+        )
+        conn.execute(
+            "DELETE FROM viewed_profiles WHERE (user_id = ? AND profile_user_id = ?) "
+            "OR (user_id = ? AND profile_user_id = ?)",
+            (user_a, user_b, user_b, user_a),
+        )
+
+
 def has_like(user_id: int, liked_user_id: int) -> bool:
     with db_connection() as conn:
         return conn.execute(

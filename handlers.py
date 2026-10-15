@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, R
 
 from db import (
     add_like,
+    clear_interaction,
     remove_like,
     get_random_stranger,
     get_user,
@@ -377,15 +378,14 @@ async def likeback_callback(call: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("reject_"))
 async def reject_callback(call: types.CallbackQuery):
-    # Отказ: лайк снимается (тот, кто лайкнул, сможет поставить его снова), уведомлений нет
+    # Отказ: из базы стирается всё, что связывает двоих (лайки и просмотры),
+    # как будто они не взаимодействовали. Тому, кто лайкнул, ничего не отправляется.
     try:
         liker_id = int(call.data.split("_", 1)[1])
     except (ValueError, IndexError):
         await call.answer()
         return
-    me = call.from_user.id
-    if not has_like(me, liker_id):  # взаимной симпатии уже нет, значит отказ допустим
-        remove_like(liker_id, me)
+    clear_interaction(call.from_user.id, liker_id)
     await _remove_buttons(call)
     await call.answer("Анкета отклонена")
 
