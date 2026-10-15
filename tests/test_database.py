@@ -34,6 +34,23 @@ class DatabaseRegressionTests(unittest.TestCase):
         self.assertEqual(db.get_user(101), db.get_user_profile(101))
         self.assertEqual(db.get_user_profile(101)[0], "Анна")
 
+    def test_bio_is_saved_updated_and_preserved_on_reinitialization(self):
+        self.assertEqual(db.get_user_bio(101), "")
+        db.save_user(101, "Анна", "2024", "БИ-101", "Компьютерные науки", "photo_a",
+                     bio="Люблю музыку и <Python>")
+        db.init_db()
+        self.assertEqual(db.get_user_bio(101), "Люблю музыку и <Python>")
+        db.save_user(101, "Анна", "2024", "БИ-101", "Компьютерные науки", "photo_b",
+                     bio="Ищу друзей")
+        self.assertEqual(db.get_user_bio(101), "Ищу друзей")
+
+    def test_bio_column_is_added_to_existing_profiles(self):
+        with db.db_connection() as conn:
+            conn.execute("ALTER TABLE user_profiles DROP COLUMN bio")
+        db.init_db()
+        self.assertEqual(db.get_user_bio(101), "")
+        self.assertEqual(db.get_user_profile(101)[0], "Анна")
+
     def test_profile_view_history_is_per_user(self):
         stranger = db.get_random_stranger(101)
         self.assertIsNotNone(stranger)

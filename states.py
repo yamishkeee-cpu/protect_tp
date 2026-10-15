@@ -6,6 +6,7 @@ class Anketa(StatesGroup):
     start_year = State()
     group_num = State()
     faculty = State()
+    bio = State()
     photo = State()
 
 # Включаем состояния из других файлов для удобства импорта

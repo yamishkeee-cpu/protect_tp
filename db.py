@@ -168,6 +168,7 @@ def init_db() -> None:
 
         # Migrate event/profile linkage columns for existing databases.
         for table, column, definition in (
+            ("user_profiles", "bio", "TEXT NOT NULL DEFAULT ''"),
             ("temp_profiles", "event_id", "INTEGER"),
             ("event_responses", "temp_profile_id", "INTEGER"),
             ("events", "participant_profile_id", "INTEGER"),
@@ -226,18 +227,18 @@ def init_db() -> None:
 
 
 def save_user_profile(user_id: int, name: str, start_year: str, group_num: str,
-                      faculty: str, photo: Optional[str]) -> None:
+                      faculty: str, photo: Optional[str], bio: str = "") -> None:
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     with db_connection() as conn:
         conn.execute(
             """INSERT INTO user_profiles
-               (user_id, name, start_year, group_num, faculty, photo, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               (user_id, name, start_year, group_num, faculty, photo, created_at, updated_at, bio)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
                  name=excluded.name, start_year=excluded.start_year,
                  group_num=excluded.group_num, faculty=excluded.faculty,
-                 photo=excluded.photo, updated_at=excluded.updated_at""",
-            (user_id, name, start_year, group_num, faculty, photo, now, now),
+                 photo=excluded.photo, updated_at=excluded.updated_at, bio=excluded.bio""",
+            (user_id, name, start_year, group_num, faculty, photo, now, now, bio),
         )
         conn.execute(
             """INSERT INTO users (user_id, name, start_year, group_num, faculty, photo, viewed)
@@ -250,9 +251,17 @@ def save_user_profile(user_id: int, name: str, start_year: str, group_num: str,
 
 
 def save_user(user_id: int, name: str, start_year: str, group_num: str,
-              faculty: str, photo: Optional[str]) -> None:
+              faculty: str, photo: Optional[str], bio: str = "") -> None:
     """Compatibility function: save the same current profile in both tables."""
-    save_user_profile(user_id, name, start_year, group_num, faculty, photo)
+    save_user_profile(user_id, name, start_year, group_num, faculty, photo, bio)
+
+
+def get_user_bio(user_id: int) -> str:
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT bio FROM user_profiles WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return (row[0] or "") if row else ""
 
 
 def get_user(user_id: int):
