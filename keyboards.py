@@ -1,4 +1,13 @@
 """Telegram keyboards used by the bot's registration and discovery flows."""
+from contextvars import ContextVar
+from typing import Optional
+
+from verification_db import get_user_status, was_ever_verified
+
+# Кто сейчас пишет боту (заполняется в bot.py, нужно для персонального меню).
+current_user_id: ContextVar[Optional[int]] = ContextVar("current_user_id", default=None)
+VERIFY_MENU_TEXT = "✉️ Подтвердить почту"
+
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -27,13 +36,19 @@ FACULTY_LIST = [
 
 
 def get_main_menu():
+    rows = [
+        [KeyboardButton(text="🔍 Поиск людей для общения")],
+        [KeyboardButton(text="🎯 Поиск для задач/проектов")],
+        [KeyboardButton(text="📅 Поиск мероприятий")],
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Заполнить заново")],
+    ]
+    user_id = current_user_id.get()
+    if user_id is not None:
+        status = get_user_status(user_id)
+        if status == "guest" or (status == "banned" and not was_ever_verified(user_id)):
+            rows.append([KeyboardButton(text=VERIFY_MENU_TEXT)])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Поиск людей для общения")],
-            [KeyboardButton(text="🎯 Поиск для задач/проектов")],
-            [KeyboardButton(text="📅 Поиск мероприятий")],
-            [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Заполнить заново")],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
     )

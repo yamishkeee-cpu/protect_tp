@@ -171,10 +171,36 @@ def init_db() -> None:
             ("temp_profiles", "event_id", "INTEGER"),
             ("event_responses", "temp_profile_id", "INTEGER"),
             ("events", "participant_profile_id", "INTEGER"),
+            ("users", "status", "TEXT NOT NULL DEFAULT 'guest'"),   # NEW
+            ("users", "verified_at", "TIMESTAMP"),                   # NEW
         ):
             columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        # --- Подтверждение почты: коды и привязка почты (хранятся только хэши) ---
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS email_verifications (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id INTEGER NOT NULL,
+                   code_hash TEXT NOT NULL,
+                   email_hash TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   expires_at TEXT NOT NULL,
+                   attempts INTEGER NOT NULL DEFAULT 0,
+                   is_used INTEGER NOT NULL DEFAULT 0
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_email_verifications_user "
+            "ON email_verifications (user_id, created_at)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS verified_emails (
+                   email_hash TEXT PRIMARY KEY,
+                   user_id INTEGER NOT NULL,
+                   verified_at TEXT NOT NULL
+               )"""
+        )
 
         # Existing DBs may predate the events tables or have duplicate responses.
         # Create a unique index only after de-duplicating old rows.

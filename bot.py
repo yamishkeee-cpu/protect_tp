@@ -1,4 +1,5 @@
 """Application entry point for the HSE NN matching Telegram bot."""
+from aiogram.client.session.aiohttp import AiohttpSession
 import asyncio
 import logging
 import os
@@ -15,17 +16,32 @@ if load_dotenv is not None:
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram import BaseMiddleware
+from keyboards import current_user_id
 
 from db import init_db
 from events_handlers import events_router
 from handlers import router as profile_router
 from temp_profile_handlers import temp_profile_router
 
+class CurrentUserMiddleware(BaseMiddleware):
+    """Запоминает id пользователя на время обработки апдейта (для персонального меню)."""
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        token = current_user_id.set(user.id if user else None)
+        try:
+            return await handler(event, data)
+        finally:
+            current_user_id.reset(token)
 
 def build_dispatcher() -> Dispatcher:
+    from verification_handlers import verification_router   # NEW (к остальным импортам)
     dispatcher = Dispatcher()
+    dispatcher.update.outer_middleware(CurrentUserMiddleware())
     # Order matters: profile/menu commands first, then task and event flows.
     dispatcher.include_router(profile_router)
+    dispatcher.include_router(verification_router)
     dispatcher.include_router(temp_profile_router)
     dispatcher.include_router(events_router)
     return dispatcher
@@ -46,8 +62,11 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     dispatcher = build_dispatcher()
+    proxy = os.getenv("PROXY_URL", "").strip() or None
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
     async with Bot(
         token=token,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     ) as bot:
         logging.getLogger(__name__).info("Бот запускается")
