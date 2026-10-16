@@ -20,6 +20,7 @@ from aiogram import BaseMiddleware
 from keyboards import current_user_id
 
 from db import init_db
+from dev_reset import dev_reset_router, is_enabled as dev_reset_enabled
 from events_handlers import events_router
 from handlers import router as profile_router
 from temp_profile_handlers import temp_profile_router
@@ -40,6 +41,8 @@ def build_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
     dispatcher.update.outer_middleware(CurrentUserMiddleware())
     # Order matters: profile/menu commands first, then task and event flows.
+    if dev_reset_enabled():
+        dispatcher.include_router(dev_reset_router)  # только для тестов, подключается первым
     dispatcher.include_router(profile_router)
     dispatcher.include_router(verification_router)
     dispatcher.include_router(temp_profile_router)

@@ -98,6 +98,14 @@ def count_requests_since(user_id: int, since_ts: str) -> int:
         ).fetchone()
     return int(row[0])
 
+def count_requests_for_email_since(email_hash: str, since_ts: str) -> int:
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM email_verifications WHERE email_hash = ? AND created_at >= ?",
+            (email_hash, since_ts),
+        ).fetchone()
+    return int(row[0])
+
 
 def create_verification(user_id: int, code_hash: str, email_hash: str,
                         created_at: str, expires_at: str, is_used: bool = False) -> int:

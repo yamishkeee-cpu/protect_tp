@@ -20,6 +20,7 @@ from email.message import EmailMessage
 from db import get_user_profile
 from verification_db import (
     complete_verification,
+    count_requests_for_email_since,
     count_requests_since,
     create_verification,
     delete_verification,
@@ -43,7 +44,9 @@ CODE_TTL_MINUTES = 10
 MAX_ATTEMPTS_PER_CODE = 5
 RESEND_COOLDOWN_SECONDS = 60
 MAX_REQUESTS_PER_DAY = 5
-# Может ли забаненный снять бан, подтвердив почту заново (открытый вопрос плана).
+# Сколько раз за сутки на один адрес можно отправлять код (со всех аккаунтов вместе).
+MAX_REQUESTS_PER_EMAIL_PER_DAY = 3
+# Может ли забаненный снять бан, подтвердив почту заново (открытый вопрос).
 ALLOW_BANNED_REVERIFY = True
 
 _LOCAL_PART_RE = re.compile(r"[a-z0-9._\-]{1,64}")
@@ -190,7 +193,9 @@ async def request_code(user_id: int, raw_email: str) -> CodeRequestResult:
         # Служебная запись: попытка учитывается в лимитах (против перебора чужих почт).
         create_verification(user_id, "", email_hash, created, expires, is_used=True)
         return CodeRequestResult("email_taken")
-
+    if count_requests_for_email_since(email_hash, since) >= MAX_REQUESTS_PER_EMAIL_PER_DAY:
+        return CodeRequestResult("email_limit")
+    
     code = generate_code()
     verification_id = create_verification(
         user_id, hash_code(user_id, code), email_hash, created, expires

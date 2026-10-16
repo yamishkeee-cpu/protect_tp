@@ -36,6 +36,9 @@ EMAIL_PROMPT = (
     "Введи свою университетскую почту ВШЭ (…@edu.hse.ru или …@hse.ru).\n"
     "На неё придёт код подтверждения."
 )
+def _mask_email(raw: str) -> str:
+    local, _, domain = raw.strip().lower().rpartition("@")
+    return f"{local[:2]}***@{domain}"
 
 MENU_BUTTONS = {
     "🔍 Поиск людей для общения",
@@ -123,7 +126,8 @@ async def process_email(message: Message, state: FSMContext):
     if status == "sent":
         await state.set_state(Verification.code)
         await message.answer(
-            f"📨 Код отправлен. Он действует {CODE_TTL_MINUTES} минут.\n"
+            f"📨 Код отправлен на {_mask_email(message.text or '')}. "
+            f"Он действует {CODE_TTL_MINUTES} минут.\n"
             f"Введи {CODE_LENGTH} цифр из письма (загляни и в «Спам»).",
             reply_markup=get_back_keyboard(),
         )
@@ -150,6 +154,7 @@ async def process_email(message: Message, state: FSMContext):
     # Остальные исходы завершают диалог.
     await state.clear()
     texts = {
+        "email_limit": "На эту почту сегодня уже отправлено слишком много кодов. Попробуй завтра.",
         "daily_limit": f"Достигнут суточный лимит ({MAX_REQUESTS_PER_DAY} запросов кода). Попробуй завтра.",
         "banned": "Доступ ограничен. Обратись к администраторам.",
         "no_profile": "Сначала заполни профиль: нажми «📝 Заполнить заново».",
