@@ -168,6 +168,7 @@ def init_db() -> None:
 
         # Migrate event/profile linkage columns for existing databases.
         for table, column, definition in (
+            ("user_profiles", "bio", "TEXT NOT NULL DEFAULT ''"),
             ("temp_profiles", "event_id", "INTEGER"),
             ("event_responses", "temp_profile_id", "INTEGER"),
             ("events", "participant_profile_id", "INTEGER"),
@@ -252,18 +253,18 @@ def init_db() -> None:
 
 
 def save_user_profile(user_id: int, name: str, start_year: str, group_num: str,
-                      faculty: str, photo: Optional[str]) -> None:
+                      faculty: str, photo: Optional[str], bio: str = "") -> None:
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     with db_connection() as conn:
         conn.execute(
             """INSERT INTO user_profiles
-               (user_id, name, start_year, group_num, faculty, photo, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               (user_id, name, start_year, group_num, faculty, photo, created_at, updated_at, bio)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
                  name=excluded.name, start_year=excluded.start_year,
                  group_num=excluded.group_num, faculty=excluded.faculty,
-                 photo=excluded.photo, updated_at=excluded.updated_at""",
-            (user_id, name, start_year, group_num, faculty, photo, now, now),
+                 photo=excluded.photo, updated_at=excluded.updated_at, bio=excluded.bio""",
+            (user_id, name, start_year, group_num, faculty, photo, now, now, bio),
         )
         conn.execute(
             """INSERT INTO users (user_id, name, start_year, group_num, faculty, photo, viewed)
@@ -276,9 +277,17 @@ def save_user_profile(user_id: int, name: str, start_year: str, group_num: str,
 
 
 def save_user(user_id: int, name: str, start_year: str, group_num: str,
-              faculty: str, photo: Optional[str]) -> None:
+              faculty: str, photo: Optional[str], bio: str = "") -> None:
     """Compatibility function: save the same current profile in both tables."""
-    save_user_profile(user_id, name, start_year, group_num, faculty, photo)
+    save_user_profile(user_id, name, start_year, group_num, faculty, photo, bio)
+
+
+def get_user_bio(user_id: int) -> str:
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT bio FROM user_profiles WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return (row[0] or "") if row else ""
 
 
 def get_user(user_id: int):
@@ -305,7 +314,7 @@ def get_user_profile(user_id: int):
 
 
 def get_random_stranger(user_id: int):
-    """Get a profile the requesting user has not viewed yet."""
+    """Следующая анкета по порядку регистрации (по времени создания профиля), которую пользователь ещё не смотрел."""
     with db_connection() as conn:
         return conn.execute(
             """SELECT u.user_id, u.name, u.start_year, u.group_num, u.faculty, u.photo
@@ -316,7 +325,9 @@ def get_random_stranger(user_id: int):
                      SELECT 1 FROM viewed_profiles v
                      WHERE v.user_id = ? AND v.profile_user_id = u.user_id
                  )
-               ORDER BY RANDOM() LIMIT 1""",
+               ORDER BY (SELECT p.created_at FROM user_profiles p WHERE p.user_id = u.user_id),
+                        u.user_id
+               LIMIT 1""",
             (user_id, user_id),
         ).fetchone()
 
@@ -353,6 +364,31 @@ def add_like(user_id: int, liked_user_id: int) -> bool:
             (user_id, liked_user_id),
         )
         return cursor.rowcount > 0
+
+
+def remove_like(user_id: int, liked_user_id: int) -> None:
+    """Убирает лайк (например, когда на него ответили отказом)."""
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM user_likes WHERE user_id = ? AND liked_user_id = ?",
+            (user_id, liked_user_id),
+        )
+
+
+def clear_interaction(user_a: int, user_b: int) -> None:
+    """Стирает всё, что связывает двух пользователей, как будто они не взаимодействовали:
+    лайки в обе стороны и отметки «просмотрено» в обе стороны."""
+    with db_connection() as conn:
+        conn.execute(
+            "DELETE FROM user_likes WHERE (user_id = ? AND liked_user_id = ?) "
+            "OR (user_id = ? AND liked_user_id = ?)",
+            (user_a, user_b, user_b, user_a),
+        )
+        conn.execute(
+            "DELETE FROM viewed_profiles WHERE (user_id = ? AND profile_user_id = ?) "
+            "OR (user_id = ? AND profile_user_id = ?)",
+            (user_a, user_b, user_b, user_a),
+        )
 
 
 def has_like(user_id: int, liked_user_id: int) -> bool:
