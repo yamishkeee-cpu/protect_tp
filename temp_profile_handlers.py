@@ -252,7 +252,7 @@ async def process_description(message: Message, state: FSMContext):
     faculty = value("faculty", profile[3] or "Не указано")
     photo = data.get("photo") if data.get("photo") is not None else profile[4]
     goal = "Ищу людей" if data.get("goal") == "ищу_людей" else "Предлагаю себя"
-    text = (
+     text = (
         "📋 <b>Проверь временную анкету</b>\n\n"
         f"👤 <b>Имя:</b> {html.escape(str(name))}\n"
         f"📅 <b>Год:</b> {html.escape(str(year))}\n"
@@ -261,11 +261,10 @@ async def process_description(message: Message, state: FSMContext):
         f"📸 <b>Фото:</b> {'есть' if photo else 'не указано'}\n"
         f"🎯 <b>Цель:</b> {goal}\n"
         f"📝 <b>Описание:</b> {html.escape(description or 'Не указано')}\n\n"
-        "Анкета будет активна 3 дня. Создать её?"
+        "⏳ <b>На сколько дней разместить анкету?</b>"
     )
-    from keyboards import get_confirm_temp_profile_keyboard
-    await message.answer(text, reply_markup=get_confirm_temp_profile_keyboard())
-    await state.set_state(TempProfile.confirm)
+    await message.answer(text, reply_markup=get_duration_keyboard())
+    await state.set_state(TempProfile.duration_choice)
 
 
 @router.callback_query(TempProfile.confirm, F.data == "confirm_temp_profile_no")
