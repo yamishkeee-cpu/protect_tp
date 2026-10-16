@@ -11,6 +11,7 @@ from aiogram.types import Message
 from db import get_user, get_user_profile
 from keyboards import (
     FACULTY_LIST,
+    get_duration_keyboard,
     get_field_choice_keyboard,
     get_main_menu,
     get_temp_profile_keyboard,
