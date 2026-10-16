@@ -23,12 +23,21 @@ from db import (
 )
 from keyboards import FACULTY_LIST, get_faculty_keyboard, get_main_menu, get_search_keyboard
 from states import Anketa
+from verification_db import get_user_status
+from verification_keyboards import get_verify_keyboard
 from aiogram.types import LinkPreviewOptions
 logger = logging.getLogger(__name__)
 router = Router()
 PROFILE_DELAY = 0.2
 
 POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-10-14-105"
+async def _offer_verification(message: Message) -> None:
+    """Кнопка подтверждения почты, если она ещё не подтверждена."""
+    if get_user_status(message.from_user.id) != "verified":
+        await message.answer(
+            "📧 Почта ВШЭ пока не подтверждена. Подтверди её, чтобы получить статус проверенного участника.",
+            reply_markup=get_verify_keyboard(),
+        )
 async def begin_registration(message: Message, state: FSMContext, first_time: bool = False) -> None:
     await state.clear()
     text = (
@@ -180,13 +189,16 @@ async def process_photo(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("🎉 Профиль сохранён! Теперь можно искать людей.", reply_markup=get_main_menu())
+    await _offer_verification(message)
 
 
 @router.message(F.text == "👤 Мой профиль")
 async def show_my_profile(message: Message, state: FSMContext):
+    await state.clear()
     user = get_user_profile(message.from_user.id) or get_user(message.from_user.id)
     if not user:
         await message.answer("Ты ещё не заполнил анкету. Нажми «📝 Заполнить заново».", reply_markup=get_main_menu())
+        await _offer_verification(message)
         return
     name, start_year, group_num, faculty, photo = user
     caption = (
@@ -209,6 +221,7 @@ async def show_my_profile(message: Message, state: FSMContext):
             await state.set_state(Anketa.photo)
             await message.answer("Твоё фото больше не открывается. Отправь, пожалуйста, новую фотографию:",
                                  reply_markup=ReplyKeyboardRemove())
+            await _offer_verification(message)
             return
     await message.answer(caption, reply_markup=get_main_menu())
 
