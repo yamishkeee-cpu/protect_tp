@@ -330,7 +330,7 @@ async def cancel_temp_profile(call: types.CallbackQuery, state: FSMContext):
 @router.callback_query(TempProfile.confirm, F.data == "confirm_temp_profile_yes")
 async def confirm_temp_profile(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    duration_days = int(data.get("duration_days") or 3)   # ← NEW (фолбэк 3 дня)
+    duration_days = int(data.get("duration_days") or 3)  
     field_data = {
         "name": data.get("name"),
         "start_year": data.get("start_year"),
