@@ -121,6 +121,7 @@ def get_search_keyboard(profile_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❤️ Нравится", callback_data=f"like_{profile_id}"),
          InlineKeyboardButton(text="⏭️ Дальше", callback_data=f"next_profile_{profile_id}")],
+        [InlineKeyboardButton(text="🚩 Пожаловаться", callback_data=f"rp:{profile_id}")],
         [InlineKeyboardButton(text="🛑 Остановить поиск", callback_data="stop_search")],
     ])
 

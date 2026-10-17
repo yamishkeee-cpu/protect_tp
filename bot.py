@@ -19,10 +19,15 @@ from aiogram.enums import ParseMode
 from aiogram import BaseMiddleware
 from keyboards import current_user_id
 
+from access_middleware import AccessMiddleware
+from admin_db import get_admin_role, init_admin_db, sync_admins_from_env
+from admin_handlers import admin_router
+from ads import ads_router
 from db import init_db
 from dev_reset import dev_reset_router, is_enabled as dev_reset_enabled
 from events_handlers import events_router
 from handlers import router as profile_router
+from report_handlers import report_router
 from temp_profile_handlers import temp_profile_router
 
 class CurrentUserMiddleware(BaseMiddleware):
@@ -39,10 +44,19 @@ class CurrentUserMiddleware(BaseMiddleware):
 def build_dispatcher() -> Dispatcher:
     from verification_handlers import verification_router   # NEW (к остальным импортам)
     dispatcher = Dispatcher()
+    # Запоминаем id пользователя на время обработки апдейта (персональное меню).
     dispatcher.update.outer_middleware(CurrentUserMiddleware())
-    # Order matters: profile/menu commands first, then task and event flows.
+    # Bans, temporary restrictions and spam limits apply to every message/callback.
+    access = AccessMiddleware()
+    dispatcher.message.outer_middleware(access)
+    dispatcher.callback_query.outer_middleware(access)
+    # Order matters: test-only reset first, then admin panel and complaints,
+    # then profile/menu commands, then task and event flows.
     if dev_reset_enabled():
         dispatcher.include_router(dev_reset_router)  # только для тестов, подключается первым
+    dispatcher.include_router(admin_router)
+    dispatcher.include_router(report_router)
+    dispatcher.include_router(ads_router)
     dispatcher.include_router(profile_router)
     dispatcher.include_router(verification_router)
     dispatcher.include_router(temp_profile_router)
@@ -60,10 +74,16 @@ async def main() -> None:
         )
 
     init_db()
+    init_admin_db()
+    sync_admins_from_env()  # ADMIN_IDS / MODERATOR_IDS -> admins table
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not any(os.getenv(name, "").strip() for name in
+               ("ADMIN_USERNAMES", "MODERATOR_USERNAMES", "ADMIN_IDS", "MODERATOR_IDS")):
+        logging.getLogger(__name__).warning(
+            "Админы не заданы: укажи ADMIN_USERNAMES (или ADMIN_IDS) в .env, иначе /admin недоступен")
     dispatcher = build_dispatcher()
     proxy = os.getenv("PROXY_URL", "").strip() or None
     session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
