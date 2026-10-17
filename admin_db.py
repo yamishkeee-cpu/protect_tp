@@ -116,8 +116,7 @@ def init_admin_db() -> None:
                 moderator_comment TEXT NOT NULL DEFAULT '',
                 target_was_registered INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                reviewed_at TEXT,
-                UNIQUE (reporter_id, target_id)
+                reviewed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_reports_status ON reports (status, created_at);
             CREATE INDEX IF NOT EXISTS idx_reports_target ON reports (target_id, status);
@@ -153,6 +152,14 @@ def init_admin_db() -> None:
             CREATE TRIGGER IF NOT EXISTS admin_actions_no_delete
                 BEFORE DELETE ON admin_actions
                 BEGIN SELECT RAISE(ABORT, 'admin_actions is append-only'); END;
+
+            -- A limit was exceeded: the action is blocked for the user until `until`.
+            CREATE TABLE IF NOT EXISTS action_blocks (
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                until TEXT NOT NULL,
+                PRIMARY KEY (user_id, action)
+            );
 
             CREATE TABLE IF NOT EXISTS action_log (
                 user_id INTEGER NOT NULL,
@@ -208,6 +215,33 @@ def init_admin_db() -> None:
             conn.execute("ALTER TABLE admins ADD COLUMN username TEXT")
         if "source" not in columns("admins"):
             conn.execute("ALTER TABLE admins ADD COLUMN source TEXT NOT NULL DEFAULT 'id'")
+
+        # Older versions limited a reporter to ONE complaint per person; that UNIQUE
+        # constraint silently dropped complaints. SQLite cannot drop it in place: rebuild.
+        if any(r["unique"] and r["origin"] == "u" for r in conn.execute("PRAGMA index_list(reports)")):
+            conn.executescript(
+                """
+                ALTER TABLE reports RENAME TO reports_old;
+                CREATE TABLE reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reporter_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    comment TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'new',
+                    decision TEXT,
+                    moderator_id INTEGER,
+                    moderator_comment TEXT NOT NULL DEFAULT '',
+                    target_was_registered INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    reviewed_at TEXT
+                );
+                INSERT INTO reports SELECT * FROM reports_old;
+                DROP TABLE reports_old;
+                CREATE INDEX IF NOT EXISTS idx_reports_status ON reports (status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_reports_target ON reports (target_id, status);
+                """
+            )
 
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_]{3,32}$")
@@ -492,6 +526,16 @@ def active_restriction(account: dict) -> Optional[str]:
     return until if until and until > _now() else None
 
 
+def last_ban_details(user_id: int) -> dict:
+    """Reason and moderator comment of the latest ban (for the notice shown to the person)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT reason, comment FROM sanctions WHERE user_id = ? AND kind IN ('temp_ban', 'perm_ban') "
+            "ORDER BY id DESC LIMIT 1", (user_id,)
+        ).fetchone()
+    return dict(row) if row else {"reason": "", "comment": ""}
+
+
 def sanction_history(user_id: int, limit: int = 10) -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
@@ -514,6 +558,9 @@ def _apply_ban(conn, user_id, days, reason, comment, admin_id, source, report_id
     if _admin_role(conn, user_id):
         raise ValueError("Нельзя заблокировать администратора или модератора")
     _ensure_row(conn, user_id)
+    acct = conn.execute("SELECT is_registered FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
+    if acct and not acct["is_registered"]:
+        ban_source = "unverified"  # lifted automatically once the account is registered
     until = PERMANENT_UNTIL if days is None else (
         datetime.now() + timedelta(days=days)).isoformat(sep=" ", timespec="seconds")
     conn.execute(
@@ -601,7 +648,7 @@ def set_registered(user_id: int, registered: bool, admin_id: Optional[int], sour
         lifted = False
         if registered:
             row = conn.execute("SELECT ban_source FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
-            if row and row["ban_source"] == "auto_report":
+            if row and row["ban_source"] in ("auto_report", "unverified"):
                 lifted = _apply_unban(conn, user_id, admin_id, source, "Подтверждена регистрация")
         return lifted
 
@@ -633,10 +680,6 @@ def create_report(reporter_id: int, target_id: int, reason: str, comment: str = 
         reporter = conn.execute("SELECT is_registered FROM accounts WHERE user_id = ?", (reporter_id,)).fetchone()
         if _get_setting(conn, "reports_only_registered") == "1" and not reporter["is_registered"]:
             return "not_allowed"
-        if conn.execute(
-            "SELECT 1 FROM reports WHERE reporter_id = ? AND target_id = ?", (reporter_id, target_id)
-        ).fetchone():
-            return "duplicate"
         day_ago = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
         sent = conn.execute(
             "SELECT COUNT(*) FROM reports WHERE reporter_id = ? AND created_at > ?", (reporter_id, day_ago)
@@ -650,23 +693,30 @@ def create_report(reporter_id: int, target_id: int, reason: str, comment: str = 
         target = conn.execute(
             "SELECT is_registered, banned_until FROM accounts WHERE user_id = ?", (target_id,)
         ).fetchone()
-        if target["banned_until"] and target["banned_until"] > _now():
-            return "already_banned"
-
         registered = bool(target["is_registered"])
+        already_banned = bool(target["banned_until"] and target["banned_until"] > _now())
+        # EVERY complaint is stored (any number per person, also repeated ones and ones against
+        # an already banned person). Against a banned person there is nothing left to decide,
+        # so it goes straight to the «Обработанные» folder.
+        if already_banned:
+            status, decision = "reviewed", "already_banned"
+        elif registered:
+            status, decision = "new", None
+        else:
+            status, decision = "auto_banned", "auto_ban"
         cursor = conn.execute(
             "INSERT INTO reports (reporter_id, target_id, reason, comment, status, decision, "
             "target_was_registered, created_at, reviewed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (reporter_id, target_id, reason, comment,
-             "new" if registered else "auto_banned",
-             None if registered else "auto_ban",
-             1 if registered else 0, _now(), None if registered else _now()),
+            (reporter_id, target_id, reason, comment, status, decision,
+             1 if registered else 0, _now(), None if status == "new" else _now()),
         )
         report_id = cursor.lastrowid
+        if already_banned:
+            return "already_banned"
         if registered:
             return "queued"
         # Not registered: instant ban without moderation.
-        _apply_ban(conn, target_id, None, f"Жалоба #{report_id}: {REPORT_REASONS[reason]}", "",
+        _apply_ban(conn, target_id, None, REPORT_REASONS[reason], "",
                    None, "auto", report_id=report_id, ban_source="auto_report")
         return "auto_banned"
 
@@ -727,7 +777,7 @@ def resolve_report(report_id: int, admin_id: int, decision: str, moderator_comme
         if not claimed:
             return None
         target_id = report["target_id"]
-        reason = f"Жалоба #{report_id}: {REPORT_REASONS.get(report['reason'], report['reason'])}"
+        reason = REPORT_REASONS.get(report["reason"], report["reason"])
         until = None
         if decision == "dismiss":
             _log(conn, admin_id, "admin", "report_dismiss", target_id, moderator_comment,
@@ -756,12 +806,28 @@ def check_and_record_action(user_id: int, action: str) -> Optional[str]:
     limit = get_int_setting(key)
     since = (datetime.now() - timedelta(seconds=window)).isoformat(sep=" ", timespec="seconds")
     with _conn() as conn:
+        def blocked_text(until: str) -> str:
+            return (f"⛔ Лимит {label} превышен (не более {limit} за {period}). "
+                    f"Это действие заблокировано до {datetime.fromisoformat(until).strftime('%H:%M')}.")
+
+        block = conn.execute(
+            "SELECT until FROM action_blocks WHERE user_id = ? AND action = ? AND until > ?",
+            (user_id, action, _now()),
+        ).fetchone()
+        if block:
+            return blocked_text(block["until"])
         used = conn.execute(
             "SELECT COUNT(*) FROM action_log WHERE user_id = ? AND action = ? AND created_at > ?",
             (user_id, action, since),
         ).fetchone()[0]
         if used >= limit:
-            return f"Достигнут лимит {label}: не более {limit} за {period}. Попробуй позже."
+            until = (datetime.now() + timedelta(hours=1)).isoformat(sep=" ", timespec="seconds")
+            conn.execute(
+                "INSERT INTO action_blocks (user_id, action, until) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, action) DO UPDATE SET until = excluded.until",
+                (user_id, action, until),
+            )
+            return blocked_text(until)
         conn.execute(
             "INSERT INTO action_log (user_id, action, created_at) VALUES (?, ?, ?)",
             (user_id, action, _now()),
@@ -770,6 +836,20 @@ def check_and_record_action(user_id: int, action: str) -> Optional[str]:
             old = (datetime.now() - timedelta(days=2)).isoformat(sep=" ", timespec="seconds")
             conn.execute("DELETE FROM action_log WHERE created_at < ?", (old,))
     return None
+
+
+def clear_all_restrictions(admin_id: int) -> tuple[int, int]:
+    """Lift every active action block and access restriction, reset the limit counters.
+    Returns (blocks_removed, restrictions_removed)."""
+    with _conn() as conn:
+        blocks = conn.execute("DELETE FROM action_blocks").rowcount
+        conn.execute("DELETE FROM action_log")
+        restrictions = conn.execute(
+            "UPDATE accounts SET restricted_until = NULL WHERE restricted_until IS NOT NULL"
+        ).rowcount
+        _log(conn, admin_id, "admin", "setting_change", None, "Сняты все ограничения",
+             f"блокировок действий: {blocks}, ограничений доступа: {restrictions}")
+    return blocks, restrictions
 
 
 # --------------------------------------------------------------------- ads

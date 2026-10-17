@@ -108,6 +108,7 @@ def settings_kb(values: dict) -> Markup:
         state = setting_state_text(key, values[key])
         label = f"{state} · {SETTING_SHORT[key]}" if kind == "bool" else f"✏️ {SETTING_SHORT[key]}: {state}"
         rows.append([Btn(text=label, callback_data=f"adm:setv:{key}")])
+    rows.append([Btn(text="🧹 Снять все ограничения", callback_data="adm:climit")])
     rows.append(BACK_TO_MENU)
     return Markup(inline_keyboard=rows)
 

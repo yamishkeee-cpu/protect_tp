@@ -72,9 +72,17 @@ class AccessMiddleware(BaseMiddleware):
 
         ban = admin_db.active_ban(account)
         if ban:
-            where = "навсегда" if ban["permanent"] else f"до {_fmt(ban['until'])}"
-            reason = f"\nПричина: {ban['reason']}" if ban["reason"] else ""
-            await self._deny(event, f"🚫 Твой аккаунт заблокирован {where}.{reason}")
+            if not account["is_registered"]:
+                # not registered: the ban is lifted automatically after registration
+                await self._deny(event, "🚫 Твой аккаунт заблокирован, но его можно восстановить, зарегистрировавшись.")
+                return None
+            details = admin_db.last_ban_details(user.id)
+            lines = ["🚫 Твой аккаунт заблокирован.",
+                     f"Причина: {details['reason'] or ban['reason'] or 'Нарушение правил'}"]
+            if details["comment"]:
+                lines.append(f"Комментарий: {details['comment']}")
+            lines.append("До: " + ("бессрочно" if ban["permanent"] else _fmt(ban["until"])))
+            await self._deny(event, "\n".join(lines))
             return None
 
         restricted_until = admin_db.active_restriction(account)

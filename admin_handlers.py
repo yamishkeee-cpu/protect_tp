@@ -337,7 +337,7 @@ async def _execute_sanction(target: Message, admin_id: int, data: dict, comment:
         await target.answer("Недостаточно прав для бана навсегда.")
         return
 
-    until, reason = None, comment or "Нарушение правил"
+    until, reason = None, "Нарушение правил"
     try:
         if rid:
             decision = {"dismiss": "dismiss", "warn": "warn", "temp": "temp_ban", "perm": "perm_ban"}[action]
@@ -345,13 +345,13 @@ async def _execute_sanction(target: Message, admin_id: int, data: dict, comment:
             if result is None:
                 await target.answer("Эта жалоба уже обработана другим модератором.")
                 return
-            until = result["until"]
+            until, reason = result["until"], result["reason"]
         elif action == "warn":
-            admin_db.warn_user(uid, reason, admin_id)
+            admin_db.warn_user(uid, comment or reason, admin_id)
         elif action == "temp":
-            until = admin_db.ban_user(uid, days, reason, admin_id)
+            until = admin_db.ban_user(uid, days, reason, admin_id, comment)
         elif action == "perm":
-            until = admin_db.ban_user(uid, None, reason, admin_id)
+            until = admin_db.ban_user(uid, None, reason, admin_id, comment)
         elif action == "unban":
             if not admin_db.unban_user(uid, admin_id, comment):
                 await target.answer("У пользователя нет активной блокировки.")
@@ -360,12 +360,18 @@ async def _execute_sanction(target: Message, admin_id: int, data: dict, comment:
         await target.answer(f"⚠️ {html.escape(str(exc))}")
         return
 
-    # tell the person concerned (not on report dismissal)
-    reason_line = f"\nПричина: {html.escape(reason)}" if (comment or not rid) else ""
+    # tell the person concerned (not on report dismissal): only reason, comment and end date
+    card = admin_db.get_user_card(uid)
+    registered = bool(card and card["is_registered"])
+    details = f"Причина: {html.escape(reason)}" + (f"\nКомментарий: {html.escape(comment)}" if comment else "")
     if action == "warn":
-        await _notify_user(bot, uid, f"⚠️ Предупреждение от модерации.{reason_line}")
+        await _notify_user(bot, uid, f"⚠️ Предупреждение от модерации.\n{details}")
     elif action in {"temp", "perm"}:
-        await _notify_user(bot, uid, f"🚫 Твой аккаунт заблокирован {fmt_dt(until)}.{reason_line}")
+        if registered:
+            await _notify_user(bot, uid, f"🚫 Твой аккаунт заблокирован.\n{details}\n"
+                                         f"До: {'бессрочно' if action == 'perm' else fmt_dt(until)}")
+        else:
+            await _notify_user(bot, uid, "🚫 Твой аккаунт заблокирован, но его можно восстановить, зарегистрировавшись.")
     elif action == "unban":
         await _notify_user(bot, uid, "✅ Блокировка снята.")
 
@@ -453,8 +459,9 @@ def _settings_text() -> str:
             f"• Новый аккаунт при первом входе: {registered}\n"
             f"• Жалобы принимаются только от зарегистрированных: {only}\n\n"
             "ℹ️ Не зарегистрированному аккаунту бан по жалобе выдаётся автоматически, "
-            "по зарегистрированному решает модератор. Лимиты защищают от спама: при слишком "
-            "частых действиях доступ ограничивается на время.")
+            "по зарегистрированному решает модератор. Если пользователь превысил лимит, это действие "
+            "блокируется для него на 1 час. При слишком частых действиях доступ ограничивается на время. "
+            "«Снять все ограничения» отменяет все такие блокировки и обнуляет счётчики.")
 
 
 @admin_router.callback_query(F.data == "adm:set")
@@ -464,6 +471,16 @@ async def cb_settings(call: types.CallbackQuery):
         return
     await call.answer()
     await _show(call, _settings_text(), settings_kb(admin_db.get_all_settings()))
+
+
+@admin_router.callback_query(F.data == "adm:climit")
+async def cb_clear_limits(call: types.CallbackQuery):
+    if _role(call.from_user.id) != ROLE_ADMIN:
+        await _deny(call)
+        return
+    blocks, restrictions = admin_db.clear_all_restrictions(call.from_user.id)
+    await call.answer(f"Все ограничения сняты.\nБлокировок действий: {blocks}\n"
+                      f"Ограничений доступа: {restrictions}", show_alert=True)
 
 
 @admin_router.callback_query(F.data.startswith("adm:setv:"))

@@ -55,7 +55,9 @@ class AdminDbTests(unittest.TestCase):
         self.assertIsNone(admin_db.active_ban(admin_db.ensure_account(110)))
         rows, total = admin_db.list_reports("n")
         report = next(r for r in rows if r["target_id"] == 110)
-        self.assertEqual(admin_db.create_report(111, 110, "abuse"), "duplicate")
+        # any number of complaints per person is allowed, every one is stored
+        self.assertEqual(admin_db.create_report(111, 110, "abuse"), "queued")
+        self.assertEqual(sum(1 for r in admin_db.list_reports("n")[0] if r["target_id"] == 110), 2)
         result = admin_db.resolve_report(report["id"], 2, "temp_ban", "ok", 7)
         self.assertEqual(result["decision"], "temp_ban")
         self.assertIsNotNone(admin_db.active_ban(admin_db.ensure_account(110)))
@@ -234,6 +236,103 @@ class AdminDbTests(unittest.TestCase):
         # keyboards need aiogram; only check the pure helper's logic through SETTINGS_META here
         self.assertEqual(admin_db.SETTINGS_META["default_registered"][1], "bool")
         self.assertEqual(admin_db.SETTINGS_META["likes_per_hour"][1], "int")
+
+    # ---- changes requested after the first review
+    def test_every_complaint_is_stored_and_rebanning_after_unban_works(self):
+        make_user(700, False)
+        make_user(701, True)
+        self.assertEqual(admin_db.create_report(701, 700, "spam"), "auto_banned")
+        # more complaints against an already banned person are still stored (processed folder)
+        self.assertEqual(admin_db.create_report(701, 700, "fake"), "already_banned")
+        rows, total = admin_db.list_reports("d", page_size=100)
+        self.assertEqual(sum(1 for r in rows if r["target_id"] == 700), 2)
+        # unban, then the same reporter can ban again
+        admin_db.unban_user(700, 1)
+        self.assertIsNone(admin_db.active_ban(admin_db.ensure_account(700)))
+        self.assertEqual(admin_db.create_report(701, 700, "spam"), "auto_banned")
+        self.assertIsNotNone(admin_db.active_ban(admin_db.ensure_account(700)))
+
+    def test_ban_follows_the_account_not_the_profile(self):
+        make_user(710, True)
+        admin_db.ban_user(710, None, "Нарушение правил", 1, "comment")
+        db.save_user_profile(710, "New name", "2025", "G9", "Филология", "new-photo")  # profile re-created
+        self.assertIsNotNone(admin_db.active_ban(admin_db.ensure_account(710)))
+        make_user(711, True)
+        self.assertNotIn(710, {db.get_random_stranger(711)[0] for _ in range(20)} - {None})
+
+    def test_unverified_ban_is_lifted_by_registration_verified_ban_is_not(self):
+        make_user(720, False)
+        admin_db.ban_user(720, 30, "Нарушение правил", 1, "c")     # manual ban of an unverified account
+        self.assertTrue(admin_db.set_registered(720, True, None, source="auto"))
+        self.assertIsNone(admin_db.active_ban(admin_db.ensure_account(720)))
+        admin_db.ban_user(720, 30, "Нарушение правил", 1, "c")     # now verified: registration does not matter
+        self.assertFalse(admin_db.set_registered(720, True, 1))
+        self.assertIsNotNone(admin_db.active_ban(admin_db.ensure_account(720)))
+
+    def test_ban_notice_has_reason_and_comment_but_no_report_number(self):
+        make_user(730, True)
+        make_user(731, True)
+        admin_db.create_report(731, 730, "spam")
+        rid = next(r["id"] for r in admin_db.list_reports("n")[0] if r["target_id"] == 730)
+        res = admin_db.resolve_report(rid, 1, "temp_ban", "Рассылка рекламы", 7)
+        self.assertEqual(res["reason"], "Спам")
+        details = admin_db.last_ban_details(730)
+        self.assertEqual((details["reason"], details["comment"]), ("Спам", "Рассылка рекламы"))
+        self.assertNotIn("#", details["reason"])
+        make_user(732, False)
+        admin_db.create_report(731, 732, "abuse")
+        self.assertNotIn("#", admin_db.last_ban_details(732)["reason"])
+
+    def test_limit_blocks_the_action_for_an_hour_and_clear_button_lifts_it(self):
+        admin_db.set_setting("likes_per_hour", "2", 1)
+        try:
+            first = [admin_db.check_and_record_action(740, "like") for _ in range(2)]
+            self.assertEqual(first, [None, None])
+            blocked = admin_db.check_and_record_action(740, "like")
+            self.assertIn("заблокировано до", blocked)
+            # still blocked even if the limit is raised: the 1 hour block is in force
+            admin_db.set_setting("likes_per_hour", "50", 1)
+            self.assertIsNotNone(admin_db.check_and_record_action(740, "like"))
+            # other actions are not affected
+            self.assertIsNone(admin_db.check_and_record_action(740, "skip"))
+            blocks, _ = admin_db.clear_all_restrictions(1)
+            self.assertGreaterEqual(blocks, 1)
+            self.assertIsNone(admin_db.check_and_record_action(740, "like"))
+        finally:
+            admin_db.set_setting("likes_per_hour", "30", 1)
+
+    def test_clear_all_restrictions_lifts_access_restriction(self):
+        make_user(750, True)
+        admin_db.restrict_user(750, 30, "test")
+        _, restrictions = admin_db.clear_all_restrictions(1)
+        self.assertGreaterEqual(restrictions, 1)
+        self.assertIsNone(admin_db.active_restriction(admin_db.ensure_account(750)))
+
+    def test_old_reports_table_with_unique_constraint_is_migrated(self):
+        import subprocess
+        path = os.path.join(_tmp.name, "old_reports.db")
+        old = sqlite3.connect(path)
+        old.executescript("""
+            CREATE TABLE reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, reporter_id INTEGER NOT NULL, target_id INTEGER NOT NULL,
+                reason TEXT NOT NULL, comment TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'new',
+                decision TEXT, moderator_id INTEGER, moderator_comment TEXT NOT NULL DEFAULT '',
+                target_was_registered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, reviewed_at TEXT,
+                UNIQUE (reporter_id, target_id));
+            INSERT INTO reports (reporter_id, target_id, reason, created_at) VALUES (1, 2, 'spam', '2026-10-14 10:00:00');
+        """)
+        old.commit()
+        old.close()
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "import db, admin_db\n"
+            "with db.db_connection() as c:\n"
+            "    c.execute(\"INSERT INTO reports (reporter_id, target_id, reason, created_at) VALUES (1, 2, 'spam', 'x')\")\n"
+            "    print(c.execute('SELECT COUNT(*) FROM reports').fetchone()[0])\n"
+        ) % str(Path(__file__).resolve().parent.parent)
+        result = subprocess.run([sys.executable, "-c", code], env=dict(os.environ, DATABASE_PATH=path),
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "2", result.stderr)
 
 
 if __name__ == "__main__":
