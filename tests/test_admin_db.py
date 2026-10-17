@@ -15,8 +15,8 @@ os.environ["MODERATOR_USERNAMES"] = "mod_user,1_id_admin"
 
 import sqlite3  # noqa: E402
 
-import admin_db  # noqa: E402
-import db  # noqa: E402
+from app.features.admin import admin_db  # noqa: E402
+from app.core import db  # noqa: E402
 
 
 def make_user(uid, registered):
@@ -157,8 +157,8 @@ class AdminDbTests(unittest.TestCase):
             self.assertIsNotNone(v(bad), bad)
 
     def test_events_and_temp_profiles_of_banned_hidden(self):
-        import events_db
-        import temp_profile_db
+        from app.features.events import events_db
+        from app.features.temp_profile import temp_profile_db
         make_user(190, True)
         make_user(191, True)
         event_id = events_db.create_event_full(190, "Поход", "2099-01-01", "2099-01-02", None, 1, 3, "d", "l")

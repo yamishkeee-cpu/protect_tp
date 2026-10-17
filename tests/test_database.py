@@ -10,9 +10,9 @@ _TEMP_DIR = tempfile.TemporaryDirectory(prefix="protect_tp_tests_")
 os.environ["DATABASE_PATH"] = str(Path(_TEMP_DIR.name) / "test.db")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import db  # noqa: E402
-import events_db  # noqa: E402
-from temp_profile_db import save_temp_profile_with_partial_fill  # noqa: E402
+from app.core import db  # noqa: E402
+from app.features.events import events_db  # noqa: E402
+from app.features.temp_profile.temp_profile_db import save_temp_profile_with_partial_fill  # noqa: E402
 
 
 class DatabaseRegressionTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class DatabaseRegressionTests(unittest.TestCase):
         db.save_user(303, "Вера", "2022", "Э-303", "Экономика", "photo_c")
 
     def test_relative_database_path_resolves_beside_the_module(self):
-        expected = Path(db.__file__).resolve().parent / "alternate.db"
+        expected = Path(db.__file__).resolve().parents[2] / "alternate.db"
         self.assertEqual(db._resolve_db_path("alternate.db"), expected)
         absolute = Path(_TEMP_DIR.name) / "alternate.db"
         self.assertEqual(db._resolve_db_path(str(absolute)), absolute)

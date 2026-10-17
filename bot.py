@@ -17,18 +17,18 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram import BaseMiddleware
-from keyboards import current_user_id
+from app.core.keyboards import current_user_id
 
-from access_middleware import AccessMiddleware
-from admin_db import get_admin_role, init_admin_db, sync_admins_from_env
-from admin_handlers import admin_router
-from ads import ads_router
-from db import init_db
-from dev_reset import dev_reset_router, is_enabled as dev_reset_enabled
-from events_handlers import events_router
-from handlers import router as profile_router
-from report_handlers import report_router
-from temp_profile_handlers import temp_profile_router
+from app.features.admin.access_middleware import AccessMiddleware
+from app.features.admin.admin_db import get_admin_role, init_admin_db, sync_admins_from_env
+from app.features.admin.admin_handlers import admin_router
+from app.features.admin.ads import ads_router
+from app.core.db import init_db
+from app.dev.dev_reset import dev_reset_router, is_enabled as dev_reset_enabled
+from app.features.events.events_handlers import events_router
+from app.features.profile.handlers import router as profile_router
+from app.features.admin.report_handlers import report_router
+from app.features.temp_profile.temp_profile_handlers import temp_profile_router
 
 class CurrentUserMiddleware(BaseMiddleware):
     """Запоминает id пользователя на время обработки апдейта (для персонального меню)."""
@@ -42,7 +42,7 @@ class CurrentUserMiddleware(BaseMiddleware):
             current_user_id.reset(token)
 
 def build_dispatcher() -> Dispatcher:
-    from verification_handlers import verification_router   # NEW (к остальным импортам)
+    from app.features.verification.verification_handlers import verification_router   # NEW (к остальным импортам)
     dispatcher = Dispatcher()
     # Запоминаем id пользователя на время обработки апдейта (персональное меню).
     dispatcher.update.outer_middleware(CurrentUserMiddleware())
