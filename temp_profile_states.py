@@ -22,5 +22,9 @@ class TempProfile(StatesGroup):
     photo = State()
     # Описание (необязательно)
     description = State()
+    #выбор срока кнопкой
+    duration_choice = State()
+    # ввод числа
+    duration_input = State()
     # Конфирмация создания
     confirm = State()

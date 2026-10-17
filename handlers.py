@@ -445,7 +445,17 @@ async def stop_search_callback(call: types.CallbackQuery):
 async def back_to_menu_callback(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await call.answer()
-    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    try:
+        await call.message.edit_text(
+            "Главное меню 👇", 
+            reply_markup=get_main_menu()
+        )
+    except TelegramAPIError:
+        try:
+            await call.message.delete()
+        except TelegramAPIError:
+            pass
+        await call.message.answer("Главное меню 👇", reply_markup=get_main_menu())
 
 
 @router.callback_query(F.data == "edit_profile")

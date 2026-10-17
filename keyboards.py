@@ -92,7 +92,22 @@ def get_confirm_temp_profile_keyboard():
         [InlineKeyboardButton(text="✅ Подтвердить анкету", callback_data="confirm_temp_profile_yes")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="confirm_temp_profile_no")],
     ])
-
+def get_duration_keyboard():
+    """Выбор срока размещения временной анкеты."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1 день",  callback_data="dur_1"),
+            InlineKeyboardButton(text="3 дня",   callback_data="dur_3"),
+            InlineKeyboardButton(text="7 дней",  callback_data="dur_7"),
+        ],
+        [
+            InlineKeyboardButton(text="14 дней", callback_data="dur_14"),
+            InlineKeyboardButton(text="30 дней", callback_data="dur_30"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Своё число", callback_data="dur_custom"),
+        ],
+    ])
 
 def get_field_choice_keyboard(field_name):
     return InlineKeyboardMarkup(inline_keyboard=[
