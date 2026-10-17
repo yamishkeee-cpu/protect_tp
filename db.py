@@ -400,10 +400,12 @@ def has_like(user_id: int, liked_user_id: int) -> bool:
 
 
 def create_temp_profile(user_id, name, start_year, group_num, faculty, photo,
-                        goal, description=None, expires_at=None):
+                        goal, description=None, expires_at=None, duration_days=None):
     now = datetime.now()
     if expires_at is None:
-        expires_at = now + timedelta(days=3)
+        days = int(duration_days) if duration_days else 3
+        days = max(1, min(days, 90))
+        expires_at = now + timedelta(days=days)
     with db_connection() as conn:
         cursor = conn.execute(
             """INSERT INTO temp_profiles
