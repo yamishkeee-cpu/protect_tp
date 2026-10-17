@@ -23,6 +23,10 @@ cp .env.example .env        # необязательно, если задаёш�
 # затем укажи BOT_TOKEN в .env; или используй команду ниже
 export BOT_TOKEN='НОВЫЙ_ТОКЕН'  # macOS/Linux
 python bot.py
+
+Создание админок(нужно создать файл .env и уже туда прописать юзернеймы
+echo "BOT_TOKEN='BOT_TOKEN' > .env
+echo "ADMIN_USERNAMES=USERNAMES" >> .env
 ```
 
 В Windows PowerShell:
