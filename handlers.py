@@ -445,7 +445,7 @@ async def stop_search_callback(call: types.CallbackQuery):
 async def back_to_menu_callback(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await call.answer()
-    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.message.answer("👇", reply_markup=get_main_menu())
 
 
 @router.callback_query(F.data == "edit_profile")

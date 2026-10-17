@@ -11,6 +11,7 @@ from aiogram.types import Message
 from db import get_user, get_user_profile
 from keyboards import (
     FACULTY_LIST,
+    get_duration_keyboard,
     get_field_choice_keyboard,
     get_main_menu,
     get_temp_profile_keyboard,
@@ -251,7 +252,7 @@ async def process_description(message: Message, state: FSMContext):
     faculty = value("faculty", profile[3] or "Не указано")
     photo = data.get("photo") if data.get("photo") is not None else profile[4]
     goal = "Ищу людей" if data.get("goal") == "ищу_людей" else "Предлагаю себя"
-    text = (
+     text = (
         "📋 <b>Проверь временную анкету</b>\n\n"
         f"👤 <b>Имя:</b> {html.escape(str(name))}\n"
         f"📅 <b>Год:</b> {html.escape(str(year))}\n"
@@ -260,13 +261,64 @@ async def process_description(message: Message, state: FSMContext):
         f"📸 <b>Фото:</b> {'есть' if photo else 'не указано'}\n"
         f"🎯 <b>Цель:</b> {goal}\n"
         f"📝 <b>Описание:</b> {html.escape(description or 'Не указано')}\n\n"
-        "Анкета будет активна 3 дня. Создать её?"
+        "⏳ <b>На сколько дней разместить анкету?</b>"
+    )
+    await message.answer(text, reply_markup=get_duration_keyboard())
+    await state.set_state(TempProfile.duration_choice)
+
+MAX_DURATION_DAYS = 90
+
+async def _show_duration_confirm(target, state: FSMContext, days: int, edit: bool = False):
+    """Показывает финальное подтверждение с выбранным сроком."""
+    data = await state.get_data()
+    goal = "Ищу людей" if data.get("goal") == "ищу_людей" else "Предлагаю себя"
+    text = (
+        "📋 <b>Проверь временную анкету</b>\n\n"
+        f"🎯 <b>Цель:</b> {goal}\n"
+        f"📝 <b>Описание:</b> {html.escape(data.get('description') or 'Не указано')}\n"
+        f"⏳ <b>Срок размещения:</b> {days} дн.\n\n"
+        "Создать её?"
     )
     from keyboards import get_confirm_temp_profile_keyboard
-    await message.answer(text, reply_markup=get_confirm_temp_profile_keyboard())
+    if edit:
+        await target.edit_text(text, reply_markup=get_confirm_temp_profile_keyboard())
+    else:
+        await target.answer(text, reply_markup=get_confirm_temp_profile_keyboard())
     await state.set_state(TempProfile.confirm)
 
 
+@router.callback_query(TempProfile.duration_choice, F.data == "dur_custom")
+async def duration_custom(call: types.CallbackQuery, state: FSMContext):
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(f"Введи срок в днях (от 1 до {MAX_DURATION_DAYS}):")
+    await state.set_state(TempProfile.duration_input)
+    await call.answer()
+
+
+@router.callback_query(TempProfile.duration_choice, F.data.startswith("dur_"))
+async def duration_chosen(call: types.CallbackQuery, state: FSMContext):
+    try:
+        days = int(call.data.removeprefix("dur_"))
+    except ValueError:
+        await call.answer("Некорректный срок", show_alert=True)
+        return
+    await state.update_data(duration_days=days)
+    await _show_duration_confirm(call.message, state, days, edit=True)
+    await call.answer()
+
+
+@router.message(TempProfile.duration_input)
+async def duration_input(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer(f"Введи число, например 5 (от 1 до {MAX_DURATION_DAYS}).")
+        return
+    days = int(text)
+    if not 1 <= days <= MAX_DURATION_DAYS:
+        await message.answer(f"Число должно быть от 1 до {MAX_DURATION_DAYS}. Попробуй ещё раз:")
+        return
+    await state.update_data(duration_days=days)
+    await _show_duration_confirm(message, state, days, edit=False)
 @router.callback_query(TempProfile.confirm, F.data == "confirm_temp_profile_no")
 async def cancel_temp_profile(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -278,6 +330,7 @@ async def cancel_temp_profile(call: types.CallbackQuery, state: FSMContext):
 @router.callback_query(TempProfile.confirm, F.data == "confirm_temp_profile_yes")
 async def confirm_temp_profile(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    duration_days = int(data.get("duration_days") or 3)  
     field_data = {
         "name": data.get("name"),
         "start_year": data.get("start_year"),
@@ -286,6 +339,7 @@ async def confirm_temp_profile(call: types.CallbackQuery, state: FSMContext):
         "photo": data.get("photo"),
         "goal": data.get("goal"),
         "description": data.get("description", ""),
+        "duration_days": duration_days,   
     }
     try:
         temp_id = save_temp_profile_with_partial_fill(call.from_user.id, field_data)
@@ -294,7 +348,11 @@ async def confirm_temp_profile(call: types.CallbackQuery, state: FSMContext):
         await call.answer("Не удалось сохранить анкету", show_alert=True)
         return
     await state.clear()
-    await call.message.edit_text(f"✅ Временная анкета создана! Её номер: {temp_id}. Она будет активна 3 дня.", reply_markup=None)
+    await call.message.edit_text(
+        f"✅ Временная анкета создана! Её номер: {temp_id}.\n"
+        f"Она будет активна {duration_days} дн.",
+        reply_markup=None,
+    )
     await call.message.answer("Главное меню:", reply_markup=get_main_menu())
     await call.answer("Анкета сохранена")
 
