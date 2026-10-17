@@ -49,7 +49,9 @@ def save_temp_profile_with_partial_fill(user_id, field_data, event_id=None):
         raise ValueError("Не указана корректная цель временной анкеты")
 
     now = datetime.now()
-    expires_at = field_data.get("expires_at") or (now + timedelta(days=3))
+    days = int(field_data.get("duration_days") or 3)   
+    days = max(1, min(days, 90))                        
+    expires_at = field_data.get("expires_at") or (now + timedelta(days=days))
     with db_connection() as conn:
         cursor = conn.execute(
             """INSERT INTO temp_profiles

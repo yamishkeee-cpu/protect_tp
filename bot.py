@@ -1,4 +1,5 @@
 """Application entry point for the HSE NN matching Telegram bot."""
+from aiogram.client.session.aiohttp import AiohttpSession
 import asyncio
 import logging
 import os
@@ -15,30 +16,49 @@ if load_dotenv is not None:
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram import BaseMiddleware
+from keyboards import current_user_id
 
 from access_middleware import AccessMiddleware
 from admin_db import get_admin_role, init_admin_db, sync_admins_from_env
 from admin_handlers import admin_router
 from ads import ads_router
 from db import init_db
+from dev_reset import dev_reset_router, is_enabled as dev_reset_enabled
 from events_handlers import events_router
 from handlers import router as profile_router
 from report_handlers import report_router
 from temp_profile_handlers import temp_profile_router
 
+class CurrentUserMiddleware(BaseMiddleware):
+    """Запоминает id пользователя на время обработки апдейта (для персонального меню)."""
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        token = current_user_id.set(user.id if user else None)
+        try:
+            return await handler(event, data)
+        finally:
+            current_user_id.reset(token)
 
 def build_dispatcher() -> Dispatcher:
+    from verification_handlers import verification_router   # NEW (к остальным импортам)
     dispatcher = Dispatcher()
+    # Запоминаем id пользователя на время обработки апдейта (персональное меню).
+    dispatcher.update.outer_middleware(CurrentUserMiddleware())
     # Bans, temporary restrictions and spam limits apply to every message/callback.
     access = AccessMiddleware()
     dispatcher.message.outer_middleware(access)
     dispatcher.callback_query.outer_middleware(access)
-    # Order matters: admin panel and complaints first, then profile/menu commands,
-    # then task and event flows.
+    # Order matters: test-only reset first, then admin panel and complaints,
+    # then profile/menu commands, then task and event flows.
+    if dev_reset_enabled():
+        dispatcher.include_router(dev_reset_router)  # только для тестов, подключается первым
     dispatcher.include_router(admin_router)
     dispatcher.include_router(report_router)
     dispatcher.include_router(ads_router)
     dispatcher.include_router(profile_router)
+    dispatcher.include_router(verification_router)
     dispatcher.include_router(temp_profile_router)
     dispatcher.include_router(events_router)
     return dispatcher
@@ -65,8 +85,11 @@ async def main() -> None:
         logging.getLogger(__name__).warning(
             "Админы не заданы: укажи ADMIN_USERNAMES (или ADMIN_IDS) в .env, иначе /admin недоступен")
     dispatcher = build_dispatcher()
+    proxy = os.getenv("PROXY_URL", "").strip() or None
+    session = AiohttpSession(proxy=proxy) if proxy else AiohttpSession()
     async with Bot(
         token=token,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     ) as bot:
         logging.getLogger(__name__).info("Бот запускается")

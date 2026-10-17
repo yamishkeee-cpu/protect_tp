@@ -1,6 +1,22 @@
 .DS_Store
-dating_bot.db
 __pycache__/
 .venv/
+.idea/
+.vscode/
+
+# секреты
 .env
+.env.local
+.env.*.local
+.env.bak
+
+# базы данных и их служебные файлы
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# логи и резервные копии
+*.log
+log.txt
 backup/

@@ -124,7 +124,7 @@ async def process_event_date_choice(call: types.CallbackQuery, state: FSMContext
 async def cancel_event_from_date_choice(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("Создание мероприятия отменено.", reply_markup=None)
-    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.message.answer("​", reply_markup=get_main_menu())
     await call.answer()
 
 
@@ -259,7 +259,7 @@ async def process_event_location(message: Message, state: FSMContext):
 async def cancel_event_creation(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("Создание мероприятия отменено.", reply_markup=None)
-    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.message.answer("​", reply_markup=get_main_menu())
     await call.answer()
 
 
@@ -292,7 +292,7 @@ async def confirm_event_creation(call: types.CallbackQuery, state: FSMContext):
         "Оно будет доступно для поиска до дня после окончания события.",
         reply_markup=None,
     )
-    await call.message.answer("Главное меню:", reply_markup=get_main_menu())
+    await call.message.answer("", reply_markup=get_main_menu())
     await call.answer("Событие сохранено")
 
 

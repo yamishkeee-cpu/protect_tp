@@ -1,4 +1,13 @@
 """Telegram keyboards used by the bot's registration and discovery flows."""
+from contextvars import ContextVar
+from typing import Optional
+
+from verification_db import get_user_status, was_ever_verified
+
+# Кто сейчас пишет боту (заполняется в bot.py, нужно для персонального меню).
+current_user_id: ContextVar[Optional[int]] = ContextVar("current_user_id", default=None)
+VERIFY_MENU_TEXT = "✉️ Подтвердить почту"
+
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -9,17 +18,13 @@ from aiogram.types import (
 FACULTY_LIST = [
     "Дизайн",
     "Иностранные языки и межкультурная бизнес-коммуникация",
-    "Компьютерные науки и технологии (Бизнес-информатика)",
-    "Компьютерные науки и технологии (Программная инженерия, очная)",
-    "Компьютерные науки и технологии (Прикладная математика и информатика)",
-    "Международная программа по бизнесу и экономике (Менеджмент)",
-    "Международная программа по бизнесу и экономике (Экономика)",
+    "Компьютерные науки и технологии",
+    "Международная программа по бизнесу и экономике",
     "Программная инженерия (очно-заочное обучение)",
     "Технологии искусственного и дополненного интеллекта",
     "Филология",
     "Фундаментальная и прикладная лингвистика",
-    "Фундаментальная и прикладная математика (Математика)",
-    "Фундаментальная и прикладная математика (Прикладная математика)",
+    "Фундаментальная и прикладная математика",
     "Цифровой маркетинг",
     "Экономика и бизнес (очно-заочное обучение)",
     "Юриспруденция",
@@ -27,13 +32,19 @@ FACULTY_LIST = [
 
 
 def get_main_menu():
+    rows = [
+        [KeyboardButton(text="🔍 Поиск людей для общения")],
+        [KeyboardButton(text="🎯 Поиск для задач/проектов")],
+        [KeyboardButton(text="📅 Поиск мероприятий")],
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Заполнить заново")],
+    ]
+    user_id = current_user_id.get()
+    if user_id is not None:
+        status = get_user_status(user_id)
+        if status == "guest" or (status == "banned" and not was_ever_verified(user_id)):
+            rows.append([KeyboardButton(text=VERIFY_MENU_TEXT)])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔍 Поиск людей для общения")],
-            [KeyboardButton(text="🎯 Поиск для задач/проектов")],
-            [KeyboardButton(text="📅 Поиск мероприятий")],
-            [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📝 Заполнить заново")],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
     )
@@ -81,7 +92,22 @@ def get_confirm_temp_profile_keyboard():
         [InlineKeyboardButton(text="✅ Подтвердить анкету", callback_data="confirm_temp_profile_yes")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="confirm_temp_profile_no")],
     ])
-
+def get_duration_keyboard():
+    """Выбор срока размещения временной анкеты."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1 день",  callback_data="dur_1"),
+            InlineKeyboardButton(text="3 дня",   callback_data="dur_3"),
+            InlineKeyboardButton(text="7 дней",  callback_data="dur_7"),
+        ],
+        [
+            InlineKeyboardButton(text="14 дней", callback_data="dur_14"),
+            InlineKeyboardButton(text="30 дней", callback_data="dur_30"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Своё число", callback_data="dur_custom"),
+        ],
+    ])
 
 def get_field_choice_keyboard(field_name):
     return InlineKeyboardMarkup(inline_keyboard=[
