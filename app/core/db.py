@@ -187,6 +187,7 @@ def init_db() -> None:
             ("events", "participant_profile_id", "INTEGER"),
             ("users", "status", "TEXT NOT NULL DEFAULT 'guest'"),   # NEW
             ("users", "verified_at", "TIMESTAMP"),                   # NEW
+            ("user_profiles", "is_active", "INTEGER NOT NULL DEFAULT 1"),   # NEW
         ):
             columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in columns:
@@ -332,6 +333,29 @@ def get_user_profile(user_id: int):
         return row
 
 
+# --- NEW: активность анкеты ---
+def is_profile_active(user_id: int) -> bool:
+    """Активна ли анкета (по умолчанию — да, даже если колонки ещё нет)."""
+    with db_connection() as conn:
+        row = conn.execute(
+            "SELECT is_active FROM user_profiles WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return bool(row[0]) if row and row[0] is not None else True
+
+
+def set_profile_active(user_id: int, active: bool) -> bool:
+    """Скрывает/показывает анкету. Возвращает False, если анкеты нет."""
+    with db_connection() as conn:
+        cur = conn.execute(
+            "UPDATE user_profiles SET is_active = ?, updated_at = ? WHERE user_id = ?",
+            (1 if active else 0,
+             datetime.now().isoformat(sep=" ", timespec="seconds"),
+             user_id),
+        )
+        return cur.rowcount > 0
+# --- /NEW ---
+
+
 def get_random_stranger(user_id: int):
     """Следующая анкета по порядку регистрации (по времени создания профиля), которую пользователь ещё не смотрел."""
     with db_connection() as conn:
@@ -339,7 +363,10 @@ def get_random_stranger(user_id: int):
             """SELECT u.user_id, u.name, u.start_year, u.group_num, u.faculty, u.photo
                FROM users AS u
                WHERE u.user_id <> ?
-                 AND EXISTS (SELECT 1 FROM user_profiles p WHERE p.user_id = u.user_id)
+                 AND EXISTS (
+                     SELECT 1 FROM user_profiles p
+                     WHERE p.user_id = u.user_id AND p.is_active = 1
+                 )
                  AND NOT EXISTS (
                      SELECT 1 FROM viewed_profiles v
                      WHERE v.user_id = ? AND v.profile_user_id = u.user_id

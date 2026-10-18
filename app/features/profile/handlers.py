@@ -20,6 +20,8 @@ from app.core.db import (
     mark_stranger_viewed,
     reset_all_viewed,
     save_user,
+    is_profile_active,   # NEW
+    set_profile_active,  # NEW
 )
 from app.features.admin.ads import maybe_show_ad
 from app.core.keyboards import FACULTY_LIST, get_faculty_keyboard, get_main_menu, get_search_keyboard
@@ -32,6 +34,18 @@ router = Router()
 PROFILE_DELAY = 0.2
 
 POLICY_URL = "https://telegra.ph/Politika-konfidencialnosti-10-14-105"
+
+
+# --- NEW: клавиатура управления активностью анкеты ---
+def _profile_manage_keyboard(active: bool) -> InlineKeyboardMarkup:
+    if active:
+        btn = InlineKeyboardButton(text="🙈 Деактивировать анкету", callback_data="profile_toggle_off")
+    else:
+        btn = InlineKeyboardButton(text="👁 Активировать анкету", callback_data="profile_toggle_on")
+    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
+# --- /NEW ---
+
+
 async def _offer_verification(message: Message) -> None:
     """Кнопка подтверждения почты, если она ещё не подтверждена."""
     if get_user_status(message.from_user.id) != "verified":
@@ -202,17 +216,24 @@ async def show_my_profile(message: Message, state: FSMContext):
         await _offer_verification(message)
         return
     name, start_year, group_num, faculty, photo = user
+    # --- NEW: статус активности + клавиатура управления ---
+    active = is_profile_active(message.from_user.id)
+    status_line = "🟢 Анкета активна" if active else "🔴 Анкета скрыта из поиска"
+    manage_kb = _profile_manage_keyboard(active)
     caption = (
         "📝 <b>Твой профиль</b>\n"
+        f"{status_line}\n"
         f"👤 Имя: {html.escape(name or 'Не указано')}\n"
         f"📅 Год поступления: {html.escape(start_year or 'Не указан')}\n"
         f"👥 Группа: {html.escape(group_num or 'Не указана')}\n"
         f"🎓 Направление: {html.escape(faculty or 'Не указано')}\n"
         f"📝 О себе: {html.escape(get_user_bio(message.from_user.id) or 'Не указано')}"
     )
+    # --- /NEW ---
     if photo:
         try:
-            await message.answer_photo(photo=photo, caption=caption, reply_markup=get_main_menu())
+            # CHANGED: reply_markup=get_main_menu() -> manage_kb (иначе кнопки деактивации не помещаются)
+            await message.answer_photo(photo=photo, caption=caption, reply_markup=manage_kb)
             return
         except TelegramBadRequest:
             # Фото устарело (например, сменился бот): просим загрузить заново, остальные данные оставляем
@@ -224,7 +245,41 @@ async def show_my_profile(message: Message, state: FSMContext):
                                  reply_markup=ReplyKeyboardRemove())
             await _offer_verification(message)
             return
-    await message.answer(caption, reply_markup=get_main_menu())
+    # CHANGED: reply_markup=get_main_menu() -> manage_kb
+    await message.answer(caption, reply_markup=manage_kb)
+
+
+# --- NEW: хендлеры активации/деактивации анкеты ---
+@router.callback_query(F.data == "profile_toggle_off")
+async def deactivate_profile_callback(call: types.CallbackQuery):
+    if not set_profile_active(call.from_user.id, False):
+        await call.answer("Анкета не найдена", show_alert=True)
+        return
+    await call.answer("Анкета скрыта")
+    try:
+        await call.message.edit_reply_markup(reply_markup=_profile_manage_keyboard(False))
+    except TelegramAPIError:
+        pass
+    await call.message.answer(
+        "🙈 Анкета скрыта из поиска. Другие пользователи её больше не увидят.\n"
+        "В любой момент можно активировать снова в «👤 Мой профиль»."
+    )
+
+
+@router.callback_query(F.data == "profile_toggle_on")
+async def activate_profile_callback(call: types.CallbackQuery):
+    if not set_profile_active(call.from_user.id, True):
+        await call.answer("Анкета не найдена", show_alert=True)
+        return
+    await call.answer("Анкета активирована")
+    try:
+        await call.message.edit_reply_markup(reply_markup=_profile_manage_keyboard(True))
+    except TelegramAPIError:
+        pass
+    await call.message.answer(
+        "👁 Анкета снова активна и будет показываться в поиске."
+    )
+# --- /NEW ---
 
 
 async def send_random_profile(message_or_call, user_id: int):
@@ -361,7 +416,8 @@ async def like_callback(call: types.CallbackQuery):
         await call.answer("Некорректная анкета", show_alert=True)
         return
     me = call.from_user.id
-    if stranger_id == me or not get_user_profile(stranger_id):
+    # CHANGED: добавлено `or not is_profile_active(stranger_id)`
+    if stranger_id == me or not get_user_profile(stranger_id) or not is_profile_active(stranger_id):
         await call.answer("Эта анкета уже недоступна", show_alert=True)
         return
     already = has_like(me, stranger_id)
@@ -398,7 +454,8 @@ async def likeback_callback(call: types.CallbackQuery):
         return
     me = call.from_user.id
     await _remove_buttons(call)
-    if not has_like(liker_id, me) or not get_user_profile(liker_id):
+    # CHANGED: добавлено `or not is_profile_active(liker_id)`
+    if not has_like(liker_id, me) or not get_user_profile(liker_id) or not is_profile_active(liker_id):
         await call.answer("Этот лайк уже недоступен", show_alert=True)
         return
     if not add_like(me, liker_id):
