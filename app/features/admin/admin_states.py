@@ -23,6 +23,10 @@ class AdCreate(StatesGroup):
     confirm = State()
 
 
+class AdEdit(StatesGroup):
+    value = State()
+
+
 class ReportFlow(StatesGroup):
     """Жалоба пользователя: комментарий для причины «Другое»."""
     comment = State()

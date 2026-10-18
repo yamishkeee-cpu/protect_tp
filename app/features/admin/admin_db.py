@@ -64,6 +64,8 @@ JOURNAL_ACTIONS = {
     "setting_change": "Изменение настроек",
     "ad_create": "Создание рекламы",
     "ad_toggle": "Вкл/выкл рекламы",
+    "ad_delete": "Удаление рекламы",
+    "ad_edit": "Редактирование рекламы",
     "auto_restrict": "Ограничение активности",
     "admin_bind": "Назначение админа по username",
 }
@@ -909,6 +911,66 @@ def get_ad(ad_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
+AD_EDIT_FIELDS = {
+    "text": "Текст", "image": "Картинка", "url": "Ссылка",
+    "button_text": "Текст кнопки", "every_n": "Частота",
+    "max_per_user": "Лимит на пользователя", "start_date": "Дата начала",
+    "end_date": "Дата окончания",
+}
+
+
+def update_ad_field(ad_id: int, field: str, value, admin_id: int) -> bool:
+    """Validate and update a single field without replacing the campaign or its stats."""
+    if field not in AD_EDIT_FIELDS:
+        raise ValueError("Неизвестный параметр рекламы.")
+    if field in ("text", "button_text"):
+        limit = 800 if field == "text" else 30
+        if not isinstance(value, str) or not 1 <= len(value.strip()) <= limit:
+            raise ValueError(f"Введите текст от 1 до {limit} символов.")
+        value = value.strip()
+    elif field == "url":
+        error = validate_ad_url(value)
+        if error:
+            raise ValueError(error)
+        value = value.strip()
+    elif field in ("every_n", "max_per_user"):
+        maximum = 1000 if field == "every_n" else 1_000_000
+        minimum = 1 if field == "every_n" else 0
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(f"Введите целое число от {minimum} до {maximum}.")
+        if field == "max_per_user":
+            value = value or None
+    elif field in ("start_date", "end_date") and value is not None:
+        try:
+            value = datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+        except (ValueError, TypeError):
+            raise ValueError("Некорректная дата.") from None
+    elif field == "image" and value is not None:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Отправьте картинку как фото.")
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM ad_campaigns WHERE id = ?", (ad_id,)).fetchone()
+        if not row:
+            return False
+        candidate = dict(row)
+        candidate[field] = value
+        if candidate["start_date"] and candidate["end_date"] and candidate["start_date"] > candidate["end_date"]:
+            raise ValueError("Дата окончания не может быть раньше даты начала.")
+        conn.execute(f"UPDATE ad_campaigns SET {field} = ? WHERE id = ?", (value, ad_id))
+        _log(conn, admin_id, "admin", "ad_edit", None,
+             f"Реклама #{ad_id}", f"Изменён параметр: {AD_EDIT_FIELDS[field]}")
+        return True
+
+
+def delete_ad(ad_id: int, admin_id: int) -> bool:
+    """Remove a slot; retain historical statistics and the audit trail."""
+    with _conn() as conn:
+        changed = conn.execute("DELETE FROM ad_campaigns WHERE id = ?", (ad_id,)).rowcount
+        if changed:
+            _log(conn, admin_id, "admin", "ad_delete", None, f"Реклама #{ad_id}", "удалена")
+        return bool(changed)
+
+
 def list_ads() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute("SELECT * FROM ad_campaigns ORDER BY id DESC LIMIT 30").fetchall()
@@ -947,7 +1009,6 @@ def next_ad_for_user(user_id: int) -> Optional[dict]:
             (today, today, counter, user_id, user_id),
         ).fetchone()
         if row:
-            conn.execute("UPDATE user_ad_state SET counter = 0 WHERE user_id = ?", (user_id,))
             return dict(row)
     return None
 
@@ -956,6 +1017,7 @@ def record_impression(ad_id: int, user_id: int) -> None:
     with _conn() as conn:
         conn.execute("INSERT INTO ad_impressions (ad_id, user_id, shown_at) VALUES (?, ?, ?)",
                      (ad_id, user_id, _now()))
+        conn.execute("UPDATE user_ad_state SET counter = 0 WHERE user_id = ?", (user_id,))
 
 
 def record_click(ad_id: int, user_id: int) -> None:

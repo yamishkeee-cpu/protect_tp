@@ -21,12 +21,12 @@ from aiogram.types import Message
 from app.features.admin import admin_db
 from app.features.admin.admin_db import JOURNAL_ACTIONS, PERMANENT_UNTIL, REPORT_REASONS, ROLE_ADMIN, SETTINGS_META
 from app.features.admin.admin_keyboards import (
-    ad_card_kb, ad_create_confirm_kb, ads_list_kb, cancel_kb, confirm_kb, journal_kb,
+    ad_card_kb, ad_create_confirm_kb, ad_edit_kb, ad_edit_value_kb, ads_list_kb, cancel_kb, confirm_kb, journal_kb,
     journal_types_kb, menu_kb, report_card_kb, reports_list_kb, search_results_kb, setting_state_text,
     settings_kb, skip_kb, user_card_kb,
 )
 from app.features.admin.admin_keyboards import SETTING_SHORT
-from app.features.admin.admin_states import AdCreate, AdminFlow
+from app.features.admin.admin_states import AdCreate, AdEdit, AdminFlow
 from app.features.admin.ads import send_ad_card
 
 logger = logging.getLogger(__name__)
@@ -550,16 +550,17 @@ def _ad_card_text(ad: dict) -> str:
 
 
 @admin_router.callback_query(F.data == "adm:ads")
-async def cb_ads(call: types.CallbackQuery):
+async def cb_ads(call: types.CallbackQuery, state: FSMContext):
     if _role(call.from_user.id) != ROLE_ADMIN:
         await _deny(call)
         return
+    await state.clear()
     await call.answer()
     await _render_ads_list(call)
 
 
 @admin_router.callback_query(F.data.startswith("adm:ad:"))
-async def cb_ad_card(call: types.CallbackQuery):
+async def cb_ad_card(call: types.CallbackQuery, state: FSMContext):
     if _role(call.from_user.id) != ROLE_ADMIN:
         await _deny(call)
         return
@@ -568,6 +569,7 @@ async def cb_ad_card(call: types.CallbackQuery):
         await call.answer("Кампания не найдена", show_alert=True)
         return
     await call.answer()
+    await state.clear()
     await _show(call, _ad_card_text(ad), ad_card_kb(ad["id"], bool(ad["is_active"])))
     try:
         await send_ad_card(call.message, ad, preview=True)
@@ -607,6 +609,147 @@ async def cb_ad_launch(call: types.CallbackQuery):
         return
     await call.answer("Реклама запущена")
     await _show(call, _ad_card_text(admin_db.get_ad(ad_id)), ad_card_kb(ad_id, True))
+
+
+@admin_router.callback_query(F.data.startswith("adm:addelete:"))
+async def cb_ad_delete(call: types.CallbackQuery):
+    if _role(call.from_user.id) != ROLE_ADMIN:
+        await _deny(call)
+        return
+    ad_id = int(call.data.split(":")[2])
+    ad = admin_db.get_ad(ad_id)
+    if not ad:
+        await call.answer("Кампания не найдена", show_alert=True)
+        return
+    await call.answer()
+    await _show(call, f"🗑 Удалить рекламный слот #{ad_id}?\n\n{esc(ad['text'][:300])}",
+                confirm_kb(f"adm:addeleteconfirm:{ad_id}", "🗑 Удалить", f"adm:ad:{ad_id}"))
+
+
+@admin_router.callback_query(F.data.startswith("adm:addeleteconfirm:"))
+async def cb_ad_delete_confirm(call: types.CallbackQuery):
+    if _role(call.from_user.id) != ROLE_ADMIN:
+        await _deny(call)
+        return
+    ad_id = int(call.data.split(":")[2])
+    deleted = admin_db.delete_ad(ad_id, call.from_user.id)
+    await call.answer("Слот удалён" if deleted else "Кампания уже удалена")
+    await _render_ads_list(call)
+
+
+# --- editing an existing slot
+@admin_router.callback_query(F.data.startswith("adm:adedit:"))
+async def cb_ad_edit(call: types.CallbackQuery, state: FSMContext):
+    if _role(call.from_user.id) != ROLE_ADMIN:
+        await _deny(call)
+        return
+    ad_id = int(call.data.split(":")[2])
+    if not admin_db.get_ad(ad_id):
+        await state.clear()
+        await call.answer("Кампания не найдена", show_alert=True)
+        return
+    await state.clear()
+    await call.answer()
+    await _show(call, f"✏️ Реклама #{ad_id} · выбери параметр для изменения.",
+                ad_edit_kb(ad_id, admin_db.AD_EDIT_FIELDS))
+
+
+@admin_router.callback_query(F.data.startswith("adm:adfield:"))
+async def cb_ad_edit_field(call: types.CallbackQuery, state: FSMContext):
+    if _role(call.from_user.id) != ROLE_ADMIN:
+        await _deny(call)
+        return
+    _, _, raw_id, field = call.data.split(":")
+    ad_id = int(raw_id)
+    ad = admin_db.get_ad(ad_id)
+    if not ad or field not in admin_db.AD_EDIT_FIELDS:
+        await call.answer("Параметр или кампания не найдены", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdEdit.value)
+    await state.update_data(ad_id=ad_id, field=field)
+    hints = {
+        "text": "Введите новый текст (1–800 символов).",
+        "image": "Отправьте новую картинку как фото или уберите текущую.",
+        "url": "Введите прямую ссылку, начинающуюся с https://.",
+        "button_text": "Введите текст кнопки (1–30 символов).",
+        "every_n": "Введите частоту: от 1 до 1000 анкет.",
+        "max_per_user": "Введите лимит: от 0 до 1000000. 0 — без ограничения.",
+        "start_date": "Введите дату начала в формате ДД.ММ.ГГГГ или уберите ограничение.",
+        "end_date": "Введите дату окончания включительно в формате ДД.ММ.ГГГГ или уберите ограничение.",
+    }
+    current = "есть фото" if field == "image" and ad[field] else ad[field]
+    if field == "max_per_user" and current is None:
+        current = "без ограничения"
+    await call.answer()
+    await _show(call, f"✏️ {admin_db.AD_EDIT_FIELDS[field]} · реклама #{ad_id}\n"
+                      f"Сейчас: {esc(current)}\n\n{hints[field]}\nИзменение сохранится после ввода.",
+                ad_edit_value_kb(ad_id, field in ("image", "start_date", "end_date")))
+
+
+async def _save_ad_edit(message: Message, state: FSMContext, value):
+    data = await state.get_data()
+    ad_id, field = data["ad_id"], data["field"]
+    try:
+        updated = admin_db.update_ad_field(ad_id, field, value, message.from_user.id)
+    except ValueError as exc:
+        await message.answer(f"⚠️ {esc(exc)}")
+        return
+    await state.clear()
+    ad = admin_db.get_ad(ad_id) if updated else None
+    if not ad:
+        await message.answer("Кампания уже удалена.")
+        return
+    await message.answer("✅ Изменения сохранены.\n\n" + _ad_card_text(ad),
+                         reply_markup=ad_card_kb(ad_id, bool(ad["is_active"])))
+
+
+@admin_router.message(StateFilter(AdEdit.value))
+async def ad_edit_value(message: Message, state: FSMContext):
+    if not _admin_only_message(message):
+        return
+    field = (await state.get_data())["field"]
+    raw = (message.text or "").strip()
+    value = raw
+    if field == "image":
+        if not message.photo:
+            await message.answer("Отправьте именно фото или нажмите «Убрать значение».")
+            return
+        value = message.photo[-1].file_id
+    elif field in ("every_n", "max_per_user"):
+        if not raw.isdecimal() or len(raw) > 7:
+            await message.answer("Введите целое число в указанном диапазоне.")
+            return
+        value = int(raw)
+    elif field in ("start_date", "end_date"):
+        parsed = _parse_date(raw)
+        if not parsed:
+            await message.answer("Формат даты: ДД.ММ.ГГГГ.")
+            return
+        value = parsed.isoformat()
+    await _save_ad_edit(message, state, value)
+
+
+@admin_router.callback_query(StateFilter(AdEdit.value), F.data == "adm:adeditclear")
+async def cb_ad_edit_clear(call: types.CallbackQuery, state: FSMContext):
+    if _role(call.from_user.id) != ROLE_ADMIN:
+        await _deny(call)
+        return
+    data = await state.get_data()
+    if data.get("field") not in ("image", "start_date", "end_date"):
+        await call.answer("Этот параметр нельзя убрать", show_alert=True)
+        return
+    # Callback messages belong to the bot, so use the administrator's ID explicitly.
+    try:
+        updated = admin_db.update_ad_field(data["ad_id"], data["field"], None, call.from_user.id)
+    except ValueError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
+    await state.clear()
+    await call.answer("Сохранено" if updated else "Кампания уже удалена")
+    ad = admin_db.get_ad(data["ad_id"]) if updated else None
+    if ad:
+        await _show(call, _ad_card_text(ad), ad_card_kb(ad["id"], bool(ad["is_active"])))
 
 
 # --- ad creation dialog

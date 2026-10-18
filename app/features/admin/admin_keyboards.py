@@ -135,7 +135,27 @@ def ads_list_kb(ads, status_label) -> Markup:
 def ad_card_kb(ad_id: int, is_active: bool) -> Markup:
     toggle = (Btn(text="⏸ Выключить", callback_data=f"adm:adt:{ad_id}:0") if is_active
               else Btn(text="▶️ Включить", callback_data=f"adm:adt:{ad_id}:1"))
-    return Markup(inline_keyboard=[[toggle], [Btn(text="🔙 К рекламе", callback_data="adm:ads")]])
+    return Markup(inline_keyboard=[
+        [toggle],
+        [Btn(text="✏️ Редактировать", callback_data=f"adm:adedit:{ad_id}")],
+        [Btn(text="🗑 Удалить слот", callback_data=f"adm:addelete:{ad_id}")],
+        [Btn(text="🔙 К рекламе", callback_data="adm:ads")],
+    ])
+
+
+def ad_edit_kb(ad_id: int, fields: dict) -> Markup:
+    return Markup(inline_keyboard=[
+        [Btn(text=label, callback_data=f"adm:adfield:{ad_id}:{field}")]
+        for field, label in fields.items()
+    ] + [[Btn(text="🔙 К слоту", callback_data=f"adm:ad:{ad_id}")]])
+
+
+def ad_edit_value_kb(ad_id: int, clearable: bool) -> Markup:
+    rows = []
+    if clearable:
+        rows.append([Btn(text="🗑 Убрать значение", callback_data="adm:adeditclear")])
+    rows.append([Btn(text="❌ Отмена", callback_data=f"adm:adedit:{ad_id}")])
+    return Markup(inline_keyboard=rows)
 
 
 def ad_create_confirm_kb() -> Markup:

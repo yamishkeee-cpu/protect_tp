@@ -309,12 +309,13 @@ async def send_random_profile(message_or_call, user_id: int):
         keyboard = get_search_keyboard(profile_id)
         if not photo:
             continue
-        await maybe_show_ad(target, user_id)  # ad card between profiles
         try:
             await target.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
-            return
         except TelegramBadRequest:
             logger.warning("Skipping profile %s: photo is not available", profile_id)
+            continue
+        await maybe_show_ad(target, user_id)  # count only successfully delivered profiles
+        return
     await target.answer("Не удалось подобрать анкету. Попробуй позже.", reply_markup=get_main_menu())
 
 

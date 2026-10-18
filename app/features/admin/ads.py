@@ -1,6 +1,8 @@
 """Ad cards shown between profiles in the main feed, plus click tracking."""
 import html
 import logging
+import asyncio
+from weakref import WeakValueDictionary
 
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramAPIError
@@ -10,6 +12,7 @@ from app.features.admin import admin_db
 
 logger = logging.getLogger(__name__)
 ads_router = Router()
+_delivery_locks = WeakValueDictionary()
 
 
 def ad_caption(ad: dict) -> str:
@@ -30,13 +33,15 @@ async def send_ad_card(target: Message, ad: dict, preview: bool = False) -> None
 
 
 async def maybe_show_ad(target: Message, user_id: int) -> None:
-    """Called before each feed profile. Never lets an ad problem break the feed."""
+    """Called once after a delivered feed profile. Serialize delivery per user."""
+    lock = _delivery_locks.setdefault(user_id, asyncio.Lock())
     try:
-        ad = admin_db.next_ad_for_user(user_id)
-        if not ad:
-            return
-        await send_ad_card(target, ad)
-        admin_db.record_impression(ad["id"], user_id)
+        async with lock:
+            ad = admin_db.next_ad_for_user(user_id)
+            if not ad:
+                return
+            await send_ad_card(target, ad)
+            admin_db.record_impression(ad["id"], user_id)
     except Exception:
         logger.exception("Ad delivery failed for user %s", user_id)
 
