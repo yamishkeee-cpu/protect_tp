@@ -237,7 +237,6 @@ class AdminDbTests(unittest.TestCase):
         self.assertEqual(admin_db.SETTINGS_META["default_registered"][1], "bool")
         self.assertEqual(admin_db.SETTINGS_META["likes_per_hour"][1], "int")
 
-    # ---- changes requested after the first review
     def test_every_complaint_is_stored_and_rebanning_after_unban_works(self):
         make_user(700, False)
         make_user(701, True)

@@ -42,7 +42,7 @@ class CurrentUserMiddleware(BaseMiddleware):
             current_user_id.reset(token)
 
 def build_dispatcher() -> Dispatcher:
-    from app.features.verification.verification_handlers import verification_router   # NEW (к остальным импортам)
+    from app.features.verification.verification_handlers import verification_router
     dispatcher = Dispatcher()
     # Запоминаем id пользователя на время обработки апдейта (персональное меню).
     dispatcher.update.outer_middleware(CurrentUserMiddleware())

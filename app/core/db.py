@@ -185,9 +185,9 @@ def init_db() -> None:
             ("temp_profiles", "event_id", "INTEGER"),
             ("event_responses", "temp_profile_id", "INTEGER"),
             ("events", "participant_profile_id", "INTEGER"),
-            ("users", "status", "TEXT NOT NULL DEFAULT 'guest'"),   # NEW
-            ("users", "verified_at", "TIMESTAMP"),                   # NEW
-            ("user_profiles", "is_active", "INTEGER NOT NULL DEFAULT 1"),   # NEW
+            ("users", "status", "TEXT NOT NULL DEFAULT 'guest'"),
+            ("users", "verified_at", "TIMESTAMP"),
+            ("user_profiles", "is_active", "INTEGER NOT NULL DEFAULT 1"),
         ):
             columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in columns:
@@ -333,7 +333,6 @@ def get_user_profile(user_id: int):
         return row
 
 
-# --- NEW: активность анкеты ---
 def is_profile_active(user_id: int) -> bool:
     """Активна ли анкета (по умолчанию — да, даже если колонки ещё нет)."""
     with db_connection() as conn:
@@ -353,7 +352,6 @@ def set_profile_active(user_id: int, active: bool) -> bool:
              user_id),
         )
         return cur.rowcount > 0
-# --- /NEW ---
 
 
 def get_random_stranger(user_id: int):
