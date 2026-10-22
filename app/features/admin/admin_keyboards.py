@@ -33,9 +33,6 @@ def user_card_kb(uid: int, banned: bool, registered: bool, role: str) -> Markup:
     rows.append([Btn(text="⚠️ Предупреждение", callback_data=f"adm:s:warn:{uid}:0:0")])
     if banned:
         rows.append([Btn(text="✅ Снять блокировку", callback_data=f"adm:s:unban:{uid}:0:0")])
-    if role == ROLE_ADMIN:
-        label = "🔁 Сделать «не зарегистрирован»" if registered else "🔁 Сделать «зарегистрирован»"
-        rows.append([Btn(text=label, callback_data=f"adm:reg:{uid}:{0 if registered else 1}")])
     rows.append([Btn(text="📜 История санкций", callback_data=f"adm:hist:{uid}")])
     rows.append(BACK_TO_MENU)
     return Markup(inline_keyboard=rows)
@@ -81,7 +78,7 @@ def confirm_kb(yes_cb: str, yes_text: str = "✅ Подтвердить", no_cb:
 
 SETTING_SHORT = {
     "default_registered": "Новый аккаунт при входе",
-    "reports_only_registered": "Жалобы только от зарегистрированных",
+    "reports_only_registered": "Жалобы только от верифицированных",
     "reports_per_day": "Жалоб в сутки от одного человека",
     "likes_per_hour": "Лайков в час",
     "skips_per_hour": "Пропусков в час",

@@ -8,6 +8,7 @@ from unittest import mock
 from app.core import db
 from app.features.verification import verification_db as vdb
 from app.features.verification import verification_service as vs
+from app.features.admin import admin_db as adb
 
 
 class DomainTests(unittest.TestCase):
@@ -31,6 +32,7 @@ class VerificationBase(unittest.IsolatedAsyncioTestCase):
         db.DB_PATH = Path(tmp.name) / "test.db"
         self.addCleanup(setattr, db, "DB_PATH", old_path)
         db.init_db()
+        adb.init_admin_db()
 
         env = mock.patch.dict(os.environ, {"EMAIL_HASH_SECRET": "s" * 32, "EMAIL_DEV_MODE": "1"})
         env.start()
@@ -188,6 +190,19 @@ class EmailBindingTests(VerificationBase):
         self.assertEqual((await vs.verify_code(2, code2)).status, "email_taken")
         self.assertEqual(vdb.get_user_status(2), "guest")
 
+    async def test_banned_verified_cannot_reverify(self):
+        self.make_user(1)
+        await self._verify(1, "a@hse.ru")
+        adb.ban_user(1, None, "Тест", admin_id=999)
+        self.assertEqual((await vs.request_code(1, "a@hse.ru")).status, "banned")
+
+    async def test_unverified_banned_lifts_ban_by_verifying(self):
+        self.make_user(1)
+        adb.ban_user(1, None, "Тест", admin_id=999)
+        res = await self._verify(1, "a@hse.ru")
+        self.assertEqual(res.status, "verified")
+        self.assertTrue(res.unbanned)
+        self.assertIsNone(adb.active_ban(adb.ensure_account(1)))
 
 class StorageTests(VerificationBase):
     async def test_no_plaintext_email_or_code_in_db(self):

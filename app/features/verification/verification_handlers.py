@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Message
 from app.core.db import get_user_profile
 from app.core.keyboards import VERIFY_MENU_TEXT, get_main_menu
 from app.features.verification.verification_db import get_user_status, was_ever_verified
+from app.features.admin.admin_db import active_ban, ensure_account
 from app.features.verification.verification_keyboards import (
     BACK_CALLBACK,
     SKIP_VERIFY_CALLBACK,
@@ -59,8 +60,9 @@ async def _begin_verification(target: Message, user_id: int, state: FSMContext):
     if get_user_status(user_id) == "verified":
         await target.answer("✅ Твоя почта уже подтверждена.", reply_markup=get_main_menu())
         return
-    if get_user_status(user_id) == "banned" and was_ever_verified(user_id):
-        await target.answer("Доступ ограничен. Обратись к администраторам.",
+    account = ensure_account(user_id)
+    if active_ban(account) and (account["is_registered"] or was_ever_verified(user_id)):
+        await target.answer("Доступ ограничен. Администратор принимает решение по разблокировке.",
                             reply_markup=get_main_menu())
         return
     await state.clear()
@@ -172,7 +174,10 @@ async def process_code(message: Message, state: FSMContext):
 
     if status == "verified":
         await state.clear()
-        await message.answer("✅ Почта подтверждена! Спасибо.", reply_markup=get_main_menu())
+        text = "✅ Почта подтверждена! Спасибо."
+        if result.unbanned:
+            text += "\n🔓 Блокировка аккаунта снята."
+        await message.answer(text, reply_markup=get_main_menu())
         return
     if status == "bad_format":
         await message.answer(f"Код состоит из {CODE_LENGTH} цифр. Попробуй ещё раз.")
@@ -195,6 +200,7 @@ async def process_code(message: Message, state: FSMContext):
         "email_taken": "Эта почта уже привязана к другому аккаунту. Обратись к администраторам.",
         "no_profile": "Сначала заполни профиль: нажми «📝 Заполнить заново».",
         "config_error": "Подтверждение почты временно недоступно. Попробуй позже.",
+        "banned": "Доступ ограничен. Администратор принимает решение по разблокировке.",
     }
     await message.answer(texts.get(status, "Что-то пошло не так. Попробуй позже."),
                          reply_markup=get_main_menu())

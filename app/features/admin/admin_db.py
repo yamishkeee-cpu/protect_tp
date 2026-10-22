@@ -34,8 +34,7 @@ REPORT_REASONS = {
 
 # key -> (title, kind, min, max). Defaults are in SETTINGS_DEFAULTS.
 SETTINGS_META = {
-    "default_registered": ("Статус новых аккаунтов (зареган / не зареган)", "bool", None, None),
-    "reports_only_registered": ("Жалобы принимаются только от зарегистрированных", "bool", None, None),
+    "reports_only_registered": ("Жалобы принимаются только от верифицированных", "bool", None, None),\
     "reports_per_day": ("Жалоб в сутки от одного пользователя", "int", 1, 100),
     "likes_per_hour": ("Лайков в час", "int", 1, 1000),
     "skips_per_hour": ("Пропусков в час", "int", 1, 5000),
@@ -44,8 +43,7 @@ SETTINGS_META = {
     "restrict_minutes": ("Длительность временного ограничения, мин", "int", 1, 1440),
 }
 SETTINGS_DEFAULTS = {
-    "default_registered": "0",
-    "reports_only_registered": "0",
+    "reports_only_registered": "1",
     "reports_per_day": "5",
     "likes_per_hour": "30",
     "skips_per_hour": "100",
@@ -244,6 +242,30 @@ def init_admin_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_reports_target ON reports (target_id, status);
                 """
             )
+            # Подтвердившие почту считаются верифицированными (строку accounts создаём, если её нет).
+            verified_ids = ("SELECT user_id FROM users WHERE status = 'verified' "
+                            "UNION SELECT user_id FROM verified_emails")
+            conn.execute(
+                f"INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at) "
+                f"SELECT user_id, 1, ? FROM ({verified_ids})", (_now(),))
+            conn.execute(
+                f"UPDATE accounts SET is_registered = 1 WHERE is_registered = 0 "
+                f"AND user_id IN ({verified_ids})")
+            # Бан верифицированного не должен сниматься подтверждением почты: только администратором.
+            conn.execute(
+                f"UPDATE accounts SET ban_source = 'admin' "
+                f"WHERE ban_source IN ('unverified', 'auto_report') AND banned_until > ? "
+                f"AND user_id IN ({verified_ids})", (_now(),))
+            # Подтвердившие почту считаются зарегистрированными (строку в accounts создаём, если её нет).
+            conn.execute(
+                "INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at) "
+                "SELECT user_id, 1, ? FROM users WHERE status = 'verified'",
+                (_now(),),
+            )
+            conn.execute(
+                "UPDATE accounts SET is_registered = 1 WHERE is_registered = 0 "
+                "AND user_id IN (SELECT user_id FROM users WHERE status = 'verified')"
+            )
 
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_]{3,32}$")
@@ -432,7 +454,7 @@ def ensure_account(user_id: int, username=_UNSET) -> dict:
                 conn.execute("UPDATE accounts SET username = ? WHERE user_id = ?", (clean, user_id))
                 row = conn.execute("SELECT * FROM accounts WHERE user_id = ?", (user_id,)).fetchone()
             return dict(row)
-        default = 1 if _get_setting(conn, "default_registered") == "1" else 0
+        default = 0
         conn.execute(
             "INSERT OR IGNORE INTO accounts (user_id, is_registered, username, created_at) VALUES (?, ?, ?, ?)",
             (user_id, default, clean, _now()),
@@ -504,8 +526,12 @@ def search_accounts(query: str, limit: int = 10) -> tuple[list[dict], int]:
 def get_user_card(user_id: int) -> Optional[dict]:
     with _conn() as conn:
         row = conn.execute(
-            """SELECT a.*, p.name, p.start_year, p.group_num, p.faculty, p.photo
-               FROM accounts a LEFT JOIN user_profiles p ON p.user_id = a.user_id
+            """SELECT a.*, p.name, p.start_year, p.group_num, p.faculty, p.photo,
+                      u.status AS verify_status, u.verified_at AS verification_at,
+                      EXISTS(SELECT 1 FROM verified_emails e WHERE e.user_id = a.user_id) AS has_email
+               FROM accounts a
+               LEFT JOIN user_profiles p ON p.user_id = a.user_id
+               LEFT JOIN users u ON u.user_id = a.user_id
                WHERE a.user_id = ?""",
             (user_id,),
         ).fetchone()
@@ -547,7 +573,7 @@ def sanction_history(user_id: int, limit: int = 10) -> list[dict]:
 
 
 def _ensure_row(conn, user_id: int) -> None:
-    default = 1 if _get_setting(conn, "default_registered") == "1" else 0
+    default = 0 # «верифицирован» выставляет только подтверждение почты
     conn.execute(
         "INSERT OR IGNORE INTO accounts (user_id, is_registered, created_at) VALUES (?, ?, ?)",
         (user_id, default, _now()),
@@ -645,6 +671,18 @@ def set_registered(user_id: int, registered: bool, admin_id: Optional[int], sour
     with _conn() as conn:
         _ensure_row(conn, user_id)
         conn.execute("UPDATE accounts SET is_registered = ? WHERE user_id = ?", (1 if registered else 0, user_id))
+                # Статус верификации в users должен совпадать с флагом.
+        if registered:
+            conn.execute(
+                "UPDATE users SET status = 'verified', verified_at = COALESCE(verified_at, ?) "
+                "WHERE user_id = ? AND status <> 'verified'",
+                (_now(), user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET status = 'guest' WHERE user_id = ? AND status = 'verified'",
+                (user_id,),
+            )
         _log(conn, admin_id, source, "status_change", user_id, "",
              "зарегистрирован" if registered else "не зарегистрирован")
         lifted = False

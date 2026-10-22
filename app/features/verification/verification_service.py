@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 from app.core.db import get_user_profile
+from app.features.admin.admin_db import active_ban, ensure_account, set_registered
+from app.features.admin.admin_db import set_registered
 from app.features.verification.verification_db import (
     complete_verification,
     count_requests_for_email_since,
@@ -67,9 +69,10 @@ class CodeRequestResult:
 @dataclass(frozen=True)
 class CodeCheckResult:
     # verified | bad_format | wrong_code | too_many_attempts | expired | no_code
-    # | email_taken | no_profile | config_error
+    # | email_taken | no_profile | config_error | banned
     status: str
     attempts_left: int = 0
+    unbanned: bool = False  # при подтверждении был снят бан
 
 
 # ---------- 1. проверка домена ----------
@@ -162,6 +165,11 @@ async def request_code(user_id: int, raw_email: str) -> CodeRequestResult:
         not ALLOW_BANNED_REVERIFY or was_ever_verified(user_id)
     ):
         return CodeRequestResult("banned")
+    # Реальный бан живёт в админке (accounts). Верифицированный (или ранее верифицированный)
+    # не может снять его подтверждением почты: решает только администратор.
+    account = ensure_account(user_id)
+    if active_ban(account) and (account["is_registered"] or was_ever_verified(user_id)):
+        return CodeRequestResult("banned")
 
     email = normalize_email(raw_email)
     if not is_allowed_email(email):
@@ -219,7 +227,11 @@ async def verify_code(user_id: int, raw_code: str) -> CodeCheckResult:
     code = (raw_code or "").strip()
     if len(code) != CODE_LENGTH or not code.isascii() or not code.isdecimal():
         return CodeCheckResult("bad_format")
-
+    
+    account = ensure_account(user_id)
+    if active_ban(account) and (account["is_registered"] or was_ever_verified(user_id)):
+        return CodeCheckResult("banned")
+    
     row = get_active_verification(user_id)
     if row is None:
         return CodeCheckResult("no_code")
@@ -249,5 +261,10 @@ async def verify_code(user_id: int, raw_code: str) -> CodeCheckResult:
     # 5. привязка почты + set_status(..., 'verified') одной транзакцией
     outcome = complete_verification(verification_id, user_id, email_hash)
     if outcome == "ok":
-        return CodeCheckResult("verified")
-    return CodeCheckResult(outcome)  # email_taken | no_profile
+        # Вызывать ПОСЛЕ транзакции complete_verification (она уже закрыта).
+        unbanned = False
+        try:
+            unbanned = set_registered(user_id, True, None, source="auto")
+        except Exception:
+            logger.exception("Не удалось выставить флаг регистрации (user %s)", user_id)
+        return CodeCheckResult("verified", unbanned=unbanned)
