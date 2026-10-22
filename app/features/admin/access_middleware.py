@@ -9,6 +9,8 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import CallbackQuery, Message
 
 from app.features.admin import admin_db
+from app.core.keyboards import VERIFY_MENU_TEXT
+from app.features.verification.verification_handlers import MENU_BUTTONS
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,20 @@ def _classify(event) -> str | None:
             return "create"
     return None
 
+async def _is_verification_event(event, data) -> bool:
+    """Незарегистрированному забаненному нужно дойти до подтверждения почты: так снимается бан."""
+    from app.features.verification.verification_handlers import MENU_BUTTONS
+    from app.core.keyboards import VERIFY_MENU_TEXT
+    if isinstance(event, CallbackQuery):
+        return (event.data or "").startswith("verify_email_")
+    if isinstance(event, Message):
+        text = event.text or ""
+        if text == VERIFY_MENU_TEXT:
+            return True
+        raw_state = data.get("raw_state") or ""
+        # кнопки меню исключены, иначе блокировку можно было бы обойти через них
+        return raw_state.startswith("Verification:") and text not in MENU_BUTTONS
+    return False
 
 class AccessMiddleware(BaseMiddleware):
     def __init__(self) -> None:
@@ -73,8 +89,11 @@ class AccessMiddleware(BaseMiddleware):
         ban = admin_db.active_ban(account)
         if ban:
             if not account["is_registered"]:
-                # not registered: the ban is lifted automatically after registration
-                await self._deny(event, "🚫 Твой аккаунт заблокирован, но его можно восстановить, зарегистрировавшись.")
+                # неверифицирован: бан снимается подтверждением почты
+                if await _is_verification_event(event, data):
+                    return await handler(event, data)
+                await self._deny(event, "🚫 Твой аккаунт заблокирован. Его можно восстановить, "
+                                        "подтвердив почту ВШЭ (кнопка «✉️ Подтвердить почту»).")
                 return None
             details = admin_db.last_ban_details(user.id)
             lines = ["🚫 Твой аккаунт заблокирован.",
@@ -82,6 +101,7 @@ class AccessMiddleware(BaseMiddleware):
             if details["comment"]:
                 lines.append(f"Комментарий: {details['comment']}")
             lines.append("До: " + ("бессрочно" if ban["permanent"] else _fmt(ban["until"])))
+            lines.append("Снять блокировку может только администратор.")
             await self._deny(event, "\n".join(lines))
             return None
 

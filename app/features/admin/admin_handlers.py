@@ -150,7 +150,10 @@ async def cb_noop(call: types.CallbackQuery):
 def _user_card_text(card: dict) -> str:
     ban = admin_db.active_ban(card)
     restriction = admin_db.active_restriction(card)
-    status = "✅ зарегистрирован" if card["is_registered"] else "🕓 не зарегистрирован"
+    verified = card.get("verify_status") == "verified"
+    status = "✅ верифицирован" if verified else "🕓 не верифицирован"
+    if bool(card["is_registered"]) != verified:
+        status += " ⚠️ флаг регистрации в админке расходится"
     lines = [
         "👤 <b>Пользователь</b>",
         f"Telegram ID: <code>{card['user_id']}</code>",
@@ -160,6 +163,8 @@ def _user_card_text(card: dict) -> str:
         f"Направление: {esc(card.get('faculty'))}",
         f"Год поступления: {esc(card.get('start_year'))} · группа: {esc(card.get('group_num'))}",
         f"Статус: {status}",
+        f"Почта ВШЭ: {'привязана' if card.get('has_email') else 'не привязана'}",
+        f"Дата верификации: {esc(str(card['verification_at'])[:10]) if card.get('verification_at') else '—'}",
     ]
     if ban:
         lines.append(f"Блокировка: 🚫 {fmt_dt(ban['until'])}" + (f" ({esc(ban['reason'])})" if ban["reason"] else ""))
@@ -244,9 +249,7 @@ async def cb_history(call: types.CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("adm:reg:"))
 async def cb_toggle_registered(call: types.CallbackQuery):
-    if _role(call.from_user.id) != ROLE_ADMIN:
-        await _deny(call)
-        return
+    await call.answer("Статус определяется подтверждением почты и вручную не меняется.", show_alert=True)
     _, _, uid_raw, value = call.data.split(":")
     uid, registered = int(uid_raw), value == "1"
     lifted = admin_db.set_registered(uid, registered, call.from_user.id)
@@ -371,7 +374,7 @@ async def _execute_sanction(target: Message, admin_id: int, data: dict, comment:
             await _notify_user(bot, uid, f"🚫 Твой аккаунт заблокирован.\n{details}\n"
                                          f"До: {'бессрочно' if action == 'perm' else fmt_dt(until)}")
         else:
-            await _notify_user(bot, uid, "🚫 Твой аккаунт заблокирован, но его можно восстановить, зарегистрировавшись.")
+            await _notify_user(bot, uid, "🚫 Твой аккаунт заблокирован, но его можно восстановить, подтвердив почту ВШЭ в боте.")
     elif action == "unban":
         await _notify_user(bot, uid, "✅ Блокировка снята.")
 
@@ -402,7 +405,7 @@ async def cb_reports(call: types.CallbackQuery):
     role = _role(call.from_user.id)
     rows, total = admin_db.list_reports(group, page, REPORTS_PAGE)
     title = "🆕 Новые жалобы" if group == "n" else "📁 Обработанные жалобы"
-    text = f"🚩 <b>{title}</b>: {total}\n\nЖалобы на незарегистрированные аккаунты блокируются автоматически и попадают в «Обработанные»."
+    text = f"🚩 <b>{title}</b>: {total}\n\nЖалобы на неверифицированные аккаунты блокируются автоматически и попадают в «Обработанные»."
     if not rows:
         text += "\n\nСписок пуст."
     await call.answer()
@@ -423,7 +426,7 @@ async def cb_report_card(call: types.CallbackQuery):
     role = _role(call.from_user.id)
     is_new = report["status"] == "new"
     status = {"new": "🆕 новая", "reviewed": "✅ рассмотрена", "auto_banned": "🤖 авто-бан"}.get(report["status"], report["status"])
-    registered = "зарегистрирован" if report["target_was_registered"] else "не зарегистрирован"
+    registered = "верифицирован" if report["target_was_registered"] else "не верифицирован"
     lines = [
         f"🚩 <b>Жалоба #{report_id}</b> · {status}",
         f"Причина: {esc(REPORT_REASONS.get(report['reason'], report['reason']))}",
@@ -450,14 +453,12 @@ async def cb_report_card(call: types.CallbackQuery):
 # ---------------------------------------------------------------- settings
 def _settings_text() -> str:
     values = admin_db.get_all_settings()
-    registered = "✅ зарегистрирован" if values["default_registered"] == "1" else "🕓 не зарегистрирован"
     only = "🟢 вкл" if values["reports_only_registered"] == "1" else "🔴 выкл"
     return ("⚙️ <b>Настройки</b>\n\n"
             "Состояние каждого пункта написано на кнопке. Переключатели (🟢/🔴, ✅/🕓) меняются "
             "одним нажатием, у пунктов с ✏️ бот спросит новое число.\n\n"
             "<b>Сейчас:</b>\n"
-            f"• Новый аккаунт при первом входе: {registered}\n"
-            f"• Жалобы принимаются только от зарегистрированных: {only}\n\n"
+            f"• Жалобы принимаются только от верифицированных: {only}\n\n"
             "ℹ️ Не зарегистрированному аккаунту бан по жалобе выдаётся автоматически, "
             "по зарегистрированному решает модератор. Если пользователь превысил лимит, это действие "
             "блокируется для него на 1 час. При слишком частых действиях доступ ограничивается на время. "
