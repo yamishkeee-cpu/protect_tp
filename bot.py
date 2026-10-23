@@ -7,7 +7,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).with_name(".env"))
-print(os.environ["EMAIL_HASH_SECRET"])
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
