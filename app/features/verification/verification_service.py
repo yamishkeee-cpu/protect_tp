@@ -13,6 +13,7 @@ import re
 import secrets
 import smtplib
 import ssl
+import certifi
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -142,7 +143,7 @@ def _send_email_sync(to_email: str, code: str) -> None:
         f"Он действует {CODE_TTL_MINUTES} минут. "
         "Если ты не запрашивал код, просто проигнорируй это письмо."
     )
-    context = ssl.create_default_context()
+    context = ssl.create_default_context(cafile=certifi.where())
     if port == 465:
         with smtplib.SMTP_SSL(host, port, timeout=15, context=context) as smtp:
             if user:
