@@ -5,13 +5,9 @@ import logging
 import os
 from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # Environment variables still work without python-dotenv.
-    load_dotenv = None
-
-if load_dotenv is not None:
-    load_dotenv(Path(__file__).with_name(".env"))
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).with_name(".env"))
+print(os.environ["EMAIL_HASH_SECRET"])
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
